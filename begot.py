@@ -103,10 +103,10 @@ correctly.
 
 """
 
-import sys, os, re, subprocess, argparse, yaml, hashlib
+import sys, os, re, subprocess, argparse, yaml, hashlib, collections
 
 BEGOTTEN = 'Begotten'
-THIRD_PARTH = 'third_party'
+THIRD_PARTY = 'third_party'
 
 # Known public servers and how many path components form the repo name.
 KNOWN_GIT_SERVERS = {
@@ -114,6 +114,7 @@ KNOWN_GIT_SERVERS = {
   'bitbucket.org': 2,
 }
 
+cc = subprocess.check_call
 join = os.path.join
 HOME = os.getenv('HOME')
 BEGOT_CACHE = os.getenv('BEGOT_CACHE') or join(HOME, '.cache', 'begot')
@@ -122,18 +123,24 @@ REPO_DIR = join(BEGOT_CACHE, 'repo')
 
 
 class BegottenFileError(Exception): pass
+class DependencyError(Exception): pass
 
 def _mkdir_p(*dirs):
   for d in dirs:
     if not os.path.isdir(d):
       os.makedirs(d)
+def _rm(*paths):
+  for p in paths:
+    if os.path.exists(p):
+      os.remove(p)
 def _ln_sf(target, path):
   if not os.path.islink(path) or os.readlink(path) != target:
-    os.remove(path)
+    _rm(path)
     os.symlink(target, path)
 
 
-Dep = namedtuple('Dep', ['name', 'git_url', 'subpath', 'ref'])
+Dep = collections.namedtuple('Dep', ['name', 'git_url', 'subpath', 'ref',
+  'aliases'])
 
 class Begotten(object):
   def __init__(self, fn):
@@ -144,58 +151,133 @@ class Begotten(object):
     if 'deps' not in self.raw:
       raise BegottenFileError("Missing 'deps' section")
     for name, val in self.raw['deps'].iteritems():
-      if isinstance(val, string):
+      if isinstance(val, str):
         val = {'import_path': val}
       if not isinstance(val, dict):
         raise BegottenFileError("Dependency value must be string or dict")
 
       val = dict(val)
 
+      val.setdefault('aliases', [])
+
       if 'import_path' in val:
         parts = val['import_path'].split('/')
         repo_parts = KNOWN_GIT_SERVERS.get(parts[0])
         if repo_parts is None:
-          raise BegottenFileError("Unknown git server %r for %r", parts[0], name)
-        val['git_url'] = 'https://' + '/'.join(parts[:repo_parts])
-        val['subpath'] = '/'.join(parts[repo_parts:])
+          raise BegottenFileError("Unknown git server %r for %r" % (
+            parts[0], name))
+        val['git_url'] = 'https://' + '/'.join(parts[:repo_parts+1])
+        val['subpath'] = '/'.join(parts[repo_parts+1:])
+        val['aliases'].append(val['import_path'])
 
       if 'git_url' not in val:
         raise BegottenFileError(
-            "Missing 'git_url' for %r; only git is supported for now", name)
+            "Missing 'git_url' for %r; only git is supported for now" % name)
+
+      if 'subpath' not in val:
+        val['subpath'] = ''
 
       if 'ref' not in val:
         # TODO: get locked ref from lockfile!
-        ref = 'master'
+        val['ref'] = 'master'
 
       yield Dep(name=name, git_url=val['git_url'], subpath=val['subpath'],
-          ref=val['ref'])
+          ref=val['ref'], aliases=val['aliases'])
 
 
 class Builder(object):
   def __init__(self, code_root):
     self.code_root = os.path.realpath(code_root)
-    hsh = hashlib.sha1(self.code_root).hexdigest()[:6]
+    hsh = hashlib.sha1(self.code_root).hexdigest()[:8]
     self.workspace = join(WORKSPACE_DIR, hsh)
+    self.bg = Begotten(join(self.code_root, BEGOTTEN))
+    self.deps = list(self.bg.deps)
 
   def build(self, pkgs):
     bin = join(self.workspace, 'bin')
-    src = join(self.workspace, 'src')
-
-    _mkdir_p(bin, src)
+    tp = join(self.workspace, 'src', THIRD_PARTY)
+    _mkdir_p(bin, tp)
     _ln_sf(bin, join(self.code_root, 'bin'))
 
-    bg = Begotten(join(self.code_root, BEGOTTEN))
+    repo_versions = {}
+    for dep in self.deps:
+      have = repo_versions.get(dep.git_url)
+      if have is not None:
+        if have != dep.ref:
+          raise DependencyError("Conflicting versions for %r: %r vs %r",
+              dep.name, have, dep.ref)
+      else:
+        repo_versions[dep.git_url] = dep.ref
 
-    for dep in bg.deps:
+    for url, ref in repo_versions.iteritems():
+      self._setup_repo(url, ref)
+
+    for dep in self.deps:
       self._setup_dep(dep)
 
     args = ['go', 'install', pkgs]
     env = dict(os.environ)
     env['GOPATH'] = self.workspace
-    subprocess.check_call(args=args, env=env)
+    cc(args=args, cwd=self.code_root, env=env)
+
+  def _repo_dir(self, url):
+    url_hash = hashlib.sha1(url).hexdigest()
+    return join(REPO_DIR, url_hash)
+
+  def _setup_repo(self, url, ref):
+    repo_dir = self._repo_dir(url)
+    if not os.path.isdir(repo_dir):
+      cc(['git', 'clone', url, repo_dir], cwd='/')
+      cc(['git', 'checkout', '-b', '__begot_work__'], cwd=repo_dir)
+    # TODO: don't reset if already on ref
+    cc(['git', 'reset', '--hard', ref], cwd=repo_dir)
+
+    self._rewrite_imports(repo_dir)
+
+  def _rewrite_imports(self, repo_dir):
+    for dirpath, _, files in os.walk(repo_dir):
+      for fn in files:
+        if not fn.endswith('.go'):
+          continue
+        self._rewrite_file(join(dirpath, fn))
+
+  def _rewrite_file(self, path):
+    # TODO: Ew ew ew.. do this using the go parser.
+    code = open(path).read().splitlines(True)
+    inimports = False
+    for i, line in enumerate(code):
+      rewrite = inimports
+      if inimports and ')' in line:
+          inimports = False
+      elif line.startswith('import ('):
+        inimports = True
+      elif line.startswith('import '):
+        rewrite = True
+      if rewrite:
+        code[i] = self._rewrite_line(line)
+    open(path, 'w').write(''.join(code))
+
+  def _rewrite_line(self, line):
+    def repl(m):
+      imp = m.group(1)
+      parts = imp.split('/')
+      if parts[0] in KNOWN_GIT_SERVERS:
+        dep_name = self._lookup_dep_name(imp)
+        if dep_name is not None:
+          imp = 'third_party/' + dep_name
+      return '"%s"' % imp
+    return re.sub(r'"([^"]+)"', repl, line)
+
+  def _lookup_dep_name(self, imp):
+    for dep in self.deps:
+      if imp in dep.aliases:
+        return dep.name
+    raise DependencyError("You haven't declared an dependency on %r" % imp)
 
   def _setup_dep(self, dep):
-    print dep
+    path = join(self.workspace, 'src', THIRD_PARTY, dep.name)
+    target = join(self._repo_dir(dep.git_url), dep.subpath)
+    _ln_sf(target, path)
 
 
 def main(argv):
@@ -203,7 +285,8 @@ def main(argv):
   if cmd == 'build':
     builder = Builder('.')
     builder.build('./...')
-
+  elif cmd == 'update':
+    pass # TODO: implement
 
 
 if __name__ == '__main__':
