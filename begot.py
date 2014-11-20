@@ -106,6 +106,7 @@ correctly.
 import sys, os, re, subprocess, argparse, yaml, hashlib, collections
 
 BEGOTTEN = 'Begotten'
+BEGOTTEN_LOCK = 'Begotten.lock'
 THIRD_PARTY = 'third_party'
 BEGOT_WORK = '__begot_work__'
 
@@ -142,12 +143,18 @@ def _ln_sf(target, path):
     os.symlink(target, path)
 
 
-Dep = collections.namedtuple('Dep', ['name', 'git_url', 'subpath', 'ref',
-  'aliases'])
+class Dep(dict):
+  def __getattr__(self, k):
+    return self[k]
+yaml.add_representer(Dep, yaml.representer.Representer.represent_dict)
+
 
 class Begotten(object):
   def __init__(self, fn):
     self.raw = yaml.safe_load(open(fn))
+
+  def save(self, fn):
+    yaml.dump(self.raw, open(fn, 'w'), default_flow_style=False)
 
   @staticmethod
   def parse_dep(name, val):
@@ -178,7 +185,6 @@ class Begotten(object):
       val['subpath'] = ''
 
     if 'ref' not in val:
-      # TODO: get locked ref from lockfile!
       val['ref'] = 'master'
 
     return Dep(name=name, git_url=val['git_url'], subpath=val['subpath'],
@@ -191,23 +197,28 @@ class Begotten(object):
     for name, val in self.raw['deps'].iteritems():
       yield Begotten.parse_dep(name, val)
 
+  def set_deps(self, deps):
+    self.raw['deps'] = dict((dep.name, dep) for dep in deps)
+
+  def set_locked_refs(self, refs):
+    self.raw['locked_refs'] = refs
+
 
 class Builder(object):
-  def __init__(self, code_root):
+  def __init__(self, code_root, use_lockfile):
     self.code_root = os.path.realpath(code_root)
     hsh = hashlib.sha1(self.code_root).hexdigest()[:8]
     self.dep_wk = join(DEP_WORKSPACE_DIR, hsh)
     self.code_wk = join(CODE_WORKSPACE_DIR, hsh)
-    self.bg = Begotten(join(self.code_root, BEGOTTEN))
+    if use_lockfile:
+      fn = join(self.code_root, BEGOTTEN_LOCK)
+    else:
+      fn = join(self.code_root, BEGOTTEN)
+    self.bg = Begotten(fn)
     self.deps = list(self.bg.deps)
+    self.locked_refs = {}
 
-  def build(self, pkgs):
-    cbin = join(self.code_wk, 'bin')
-    tp = join(self.dep_wk, 'src', THIRD_PARTY)
-    _mkdir_p(cbin, tp)
-    _ln_sf(cbin, join(self.code_root, 'bin'))
-    _ln_sf(self.code_root, join(self.code_wk, 'src'))
-
+  def setup_repos(self):
     processed_deps = 0
     repo_versions = {}
 
@@ -216,18 +227,32 @@ class Builder(object):
 
       for dep in self.deps[processed_deps:]:
         have = repo_versions.get(dep.git_url)
+        want = self._resolve_ref(dep.git_url, dep.ref)
         if have is not None:
-          if have != dep.ref:
-            raise DependencyError("Conflicting versions for %r: %r vs %r",
-                dep.name, have, dep.ref)
+          if have != want:
+            raise DependencyError(
+                "Conflicting versions for %r: have %s, want %s (%s)",
+                dep.name, have, want, dep.ref)
         else:
-          repo_versions[dep.git_url] = dep.ref
-          repos_to_setup.append((dep.git_url, dep.ref))
+          repo_versions[dep.git_url] = want
+          repos_to_setup.append(dep.git_url)
 
       processed_deps = len(self.deps)
 
-      for url, ref in repos_to_setup:
-        self._setup_repo(url, ref)
+      # This will add newly-found dependencies to self.deps.
+      for url in repos_to_setup:
+        self._setup_repo(url, repo_versions[url])
+
+    self.bg.set_locked_refs(repo_versions)
+    self.bg.set_deps(self.deps)
+    self.bg.save(join(self.code_root, BEGOTTEN_LOCK))
+
+  def build(self, pkgs):
+    cbin = join(self.code_wk, 'bin')
+    tp = join(self.dep_wk, 'src', THIRD_PARTY)
+    _mkdir_p(cbin, tp)
+    _ln_sf(cbin, join(self.code_root, 'bin'))
+    _ln_sf(self.code_root, join(self.code_wk, 'src'))
 
     for dep in self.deps:
       self._setup_dep(dep)
@@ -244,15 +269,24 @@ class Builder(object):
     url_hash = hashlib.sha1(url).hexdigest()
     return join(REPO_DIR, url_hash)
 
-  def _setup_repo(self, url, ref):
+  def _resolve_ref(self, url, ref):
     repo_dir = self._repo_dir(url)
     if not os.path.isdir(repo_dir):
       print "Fetching %s" % url
-      cc(['git', 'clone', url, repo_dir], cwd='/')
-      cc(['git', 'checkout', '-b', BEGOT_WORK], cwd=repo_dir)
+      cc(['git', 'clone', '-q', url, repo_dir], cwd='/')
+      cc(['git', 'checkout', '-q', '-b', BEGOT_WORK], cwd=repo_dir)
+
+    try:
+      return co(['git', 'rev-parse', '--verify', ref], cwd=repo_dir).strip()
+    except subprocess.CalledProcessError:
+      return co(['git', 'rev-parse', '--verify', 'origin/' + ref], cwd=repo_dir).strip()
+
+  def _setup_repo(self, url, resolved_ref):
+    repo_dir = self._repo_dir(url)
 
     # TODO: skip reset and rewrite if already done
-    cc(['git', 'reset', '-q', '--hard', ref], cwd=repo_dir)
+    print 'Setting up %s' % url
+    cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
     self._rewrite_imports(repo_dir)
 
   def _rewrite_imports(self, repo_dir):
@@ -307,11 +341,12 @@ class Builder(object):
 
 def main(argv):
   cmd = argv[0]
-  if cmd == 'build':
-    builder = Builder('.')
+  if cmd == 'update':
+    builder = Builder('.', False)
+    builder.setup_repos()
+  elif cmd == 'build':
+    builder = Builder('.', True)
     builder.build('./...')
-  elif cmd == 'update':
-    pass # TODO: implement
 
 
 if __name__ == '__main__':
