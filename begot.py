@@ -78,36 +78,35 @@ temporary workspace created by begot, along with your dependencies.
 A Begotten file is in yaml format and looks roughly like this:
 
   deps:
-    docker: github.com/fsouza/go-dockerclient
-    systemstat: bitbucket.org/bertimus9/systemstat
-    mux:
+    third_party/docker: github.com/fsouza/go-dockerclient
+    third_party/systemstat: bitbucket.org/bertimus9/systemstat
+    third_party/gorilla/mux:
       import_path: github.com/gorilla/mux
-    util:
+    tddium/util:
       git_repo: git@github.com:solanolabs/tddium_go
       subpath: util
-    client:
+    tddium/client:
       git_url: git@github.com:solanolabs/tddium_go
       subpath: client
 
 Things to note:
 - A plain string is shorthand for {"import_path": ...}
 - You can override the git url used, in a single place, which will apply to the
-  whole project.
+  whole project and all of its dependencies.
 
 TODO: document rigorously!
 TODO: document requesting a specific branch/tag/ref
 
 In your code, you can then refer to these deps with the import path
-"third_party/docker", etc. and begot will set up the temporary workspace
-correctly.
+"third_party/docker", "third_party/gorilla/mux", etc. and begot will set up the temporary
+workspace correctly.
 
 """
 
-import sys, os, re, subprocess, argparse, yaml, hashlib, collections
+import sys, os, re, subprocess, argparse, yaml, hashlib, collections, errno
 
 BEGOTTEN = 'Begotten'
 BEGOTTEN_LOCK = 'Begotten.lock'
-THIRD_PARTY = 'third_party'
 BEGOT_WORK = '__begot_work__'
 
 # Known public servers and how many path components form the repo name.
@@ -140,6 +139,7 @@ def _rm(*paths):
 def _ln_sf(target, path):
   if not os.path.islink(path) or os.readlink(path) != target:
     _rm(path)
+    _mkdir_p(os.path.dirname(path))
     os.symlink(target, path)
 
 
@@ -204,7 +204,7 @@ class Begotten(object):
 
 
 class Builder(object):
-  def __init__(self, code_root, use_lockfile):
+  def __init__(self, code_root='.', use_lockfile=True):
     self.code_root = os.path.realpath(code_root)
     hsh = hashlib.sha1(self.code_root).hexdigest()[:8]
     self.dep_wk = join(DEP_WORKSPACE_DIR, hsh)
@@ -250,20 +250,37 @@ class Builder(object):
     self.bg.set_deps(self.deps)
     self.bg.save(join(self.code_root, BEGOTTEN_LOCK))
 
-  def build(self, pkgs):
+  def run(self, *args):
+    # Set up code_wk.
     cbin = join(self.code_wk, 'bin')
-    tp = join(self.dep_wk, 'src', THIRD_PARTY)
-    _mkdir_p(cbin, tp)
+    depsrc = join(self.dep_wk, 'src')
+    _mkdir_p(cbin, depsrc)
     _ln_sf(cbin, join(self.code_root, 'bin'))
     _ln_sf(self.code_root, join(self.code_wk, 'src'))
 
-    for dep in self.deps:
-      self._setup_dep(dep)
+    old_deps = set(co(['find', depsrc, '-type', 'l', '-print0']).split('\0'))
+    old_deps.discard('')
 
-    args = ['go', 'install', pkgs]
+    for dep in self.deps:
+      path = self._setup_dep(dep)
+      old_deps.discard(path)
+
+    # Remove unexpected deps.
+    if old_deps:
+      for old_dep in old_deps:
+        os.remove(old_dep)
+      for dir in co(['find', depsrc, '-depth', '-type', 'd', '-print0']).split('\0'):
+        if not dir: continue
+        try:
+          os.rmdir(dir)
+        except OSError, e:
+          if e.errno != errno.ENOTEMPTY:
+            raise
+
     env = dict(os.environ)
     env['GOPATH'] = ':'.join((self.code_wk, self.dep_wk))
-    cc(args=args, cwd=self.code_root, env=env)
+    os.chdir(self.code_root)
+    os.execvpe(args[0], args, env)
 
   def _add_implicit_dep(self, name, val):
     self.deps.append(Begotten.parse_dep(name, val))
@@ -326,7 +343,7 @@ class Builder(object):
       if parts[0] in KNOWN_GIT_SERVERS:
         dep_name = self._lookup_dep_name(imp)
         if dep_name is not None:
-          imp = 'third_party/' + dep_name
+          imp = dep_name
       return '"%s"' % imp
     return re.sub(r'"([^"]+)"', repl, line)
 
@@ -336,28 +353,31 @@ class Builder(object):
         return dep.name
 
     #print "Found implicit dependency %s" % imp
-    name = '_implicit_%s' % re.sub(r'\W', '_', imp)
+    name = '_begot_implicit/' + re.sub(r'\W', '_', imp)
     self._add_implicit_dep(name, imp)
     return name
 
   def _setup_dep(self, dep):
-    path = join(self.dep_wk, 'src', THIRD_PARTY, dep.name)
+    path = join(self.dep_wk, 'src', dep.name)
     target = join(self._repo_dir(dep.git_url), dep.subpath)
     _ln_sf(target, path)
+    return path
 
 
 def main(argv):
   cmd = argv[0]
   if cmd == 'update':
-    builder = Builder('.', use_lockfile=False)
+    builder = Builder(use_lockfile=False)
     builder.setup_repos(update=True)
     builder.save_lockfile()
   elif cmd == 'fetch':
-    builder = Builder('.', use_lockfile=True)
-    builder.setup_repos(update=False)
+    Builder().setup_repos(update=False)
   elif cmd == 'build':
-    builder = Builder('.', use_lockfile=True)
-    builder.build('./...')
+    Builder().run('go', 'install', './...')
+  elif cmd == 'go':
+    Builder().run('go', *argv[1:])
+  elif cmd == 'exec':
+    Builder().run(*argv[1:])
 
 
 if __name__ == '__main__':
