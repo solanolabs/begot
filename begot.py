@@ -103,7 +103,7 @@ workspace correctly.
 
 """
 
-import sys, os, re, subprocess, argparse, yaml, hashlib, collections, errno
+import sys, os, re, subprocess, argparse, yaml, hashlib, collections, errno, shutil
 
 BEGOTTEN = 'Begotten'
 BEGOTTEN_LOCK = 'Begotten.lock'
@@ -250,38 +250,6 @@ class Builder(object):
     self.bg.set_deps(self.deps)
     self.bg.save(join(self.code_root, BEGOTTEN_LOCK))
 
-  def run(self, *args):
-    # Set up code_wk.
-    cbin = join(self.code_wk, 'bin')
-    depsrc = join(self.dep_wk, 'src')
-    _mkdir_p(cbin, depsrc)
-    _ln_sf(cbin, join(self.code_root, 'bin'))
-    _ln_sf(self.code_root, join(self.code_wk, 'src'))
-
-    old_deps = set(co(['find', depsrc, '-type', 'l', '-print0']).split('\0'))
-    old_deps.discard('')
-
-    for dep in self.deps:
-      path = self._setup_dep(dep)
-      old_deps.discard(path)
-
-    # Remove unexpected deps.
-    if old_deps:
-      for old_dep in old_deps:
-        os.remove(old_dep)
-      for dir in co(['find', depsrc, '-depth', '-type', 'd', '-print0']).split('\0'):
-        if not dir: continue
-        try:
-          os.rmdir(dir)
-        except OSError, e:
-          if e.errno != errno.ENOTEMPTY:
-            raise
-
-    env = dict(os.environ)
-    env['GOPATH'] = ':'.join((self.code_wk, self.dep_wk))
-    os.chdir(self.code_root)
-    os.execvpe(args[0], args, env)
-
   def _add_implicit_dep(self, name, val):
     self.deps.append(Begotten.parse_dep(name, val))
 
@@ -357,11 +325,48 @@ class Builder(object):
     self._add_implicit_dep(name, imp)
     return name
 
+  def run(self, *args):
+    # Set up code_wk.
+    cbin = join(self.code_wk, 'bin')
+    depsrc = join(self.dep_wk, 'src')
+    _mkdir_p(cbin, depsrc)
+    _ln_sf(cbin, join(self.code_root, 'bin'))
+    _ln_sf(self.code_root, join(self.code_wk, 'src'))
+
+    old_deps = set(co(['find', depsrc, '-type', 'l', '-print0']).split('\0'))
+    old_deps.discard('')
+
+    for dep in self.deps:
+      path = self._setup_dep(dep)
+      old_deps.discard(path)
+
+    # Remove unexpected deps.
+    if old_deps:
+      for old_dep in old_deps:
+        os.remove(old_dep)
+      for dir in co(['find', depsrc, '-depth', '-type', 'd', '-print0']).split('\0'):
+        if not dir: continue
+        try:
+          os.rmdir(dir)
+        except OSError, e:
+          if e.errno != errno.ENOTEMPTY:
+            raise
+
+    # Overwrite any existing GOPATH.
+    os.putenv('GOPATH', ':'.join((self.code_wk, self.dep_wk)))
+    os.chdir(self.code_root)
+    os.execvp(args[0], args)
+
   def _setup_dep(self, dep):
     path = join(self.dep_wk, 'src', dep.name)
     target = join(self._repo_dir(dep.git_url), dep.subpath)
     _ln_sf(target, path)
     return path
+
+  def clean(self):
+    shutil.rmtree(self.dep_wk, ignore_errors=True)
+    shutil.rmtree(self.code_wk, ignore_errors=True)
+    _rm(join(self.code_root, 'bin'))
 
 
 def main(argv):
@@ -378,6 +383,10 @@ def main(argv):
     Builder().run('go', *argv[1:])
   elif cmd == 'exec':
     Builder().run(*argv[1:])
+  elif cmd == 'clean':
+    Builder(use_lockfile=False).clean()
+  else:
+    raise Exception("Unknown subcommand %r" % cmd)
 
 
 if __name__ == '__main__':
