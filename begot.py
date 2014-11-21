@@ -146,6 +146,8 @@ def _ln_sf(target, path):
 class Dep(dict):
   def __getattr__(self, k):
     return self[k]
+  def __setattr__(self, k, v):
+    self[k] = v
 yaml.add_representer(Dep, yaml.representer.Representer.represent_dict)
 
 
@@ -200,9 +202,6 @@ class Begotten(object):
   def set_deps(self, deps):
     self.raw['deps'] = dict((dep.name, dep) for dep in deps)
 
-  def set_locked_refs(self, refs):
-    self.raw['locked_refs'] = refs
-
 
 class Builder(object):
   def __init__(self, code_root, use_lockfile):
@@ -216,18 +215,21 @@ class Builder(object):
       fn = join(self.code_root, BEGOTTEN)
     self.bg = Begotten(fn)
     self.deps = list(self.bg.deps)
-    self.locked_refs = {}
 
-  def setup_repos(self):
+  def setup_repos(self, update):
     processed_deps = 0
     repo_versions = {}
+    if update:
+      updated_set = set()
+    else:
+      updated_set = None
 
     while processed_deps < len(self.deps):
       repos_to_setup = []
 
       for dep in self.deps[processed_deps:]:
         have = repo_versions.get(dep.git_url)
-        want = self._resolve_ref(dep.git_url, dep.ref)
+        want = self._resolve_ref(dep.git_url, dep.ref, updated_set)
         if have is not None:
           if have != want:
             raise DependencyError(
@@ -236,6 +238,7 @@ class Builder(object):
         else:
           repo_versions[dep.git_url] = want
           repos_to_setup.append(dep.git_url)
+        dep.ref = want
 
       processed_deps = len(self.deps)
 
@@ -243,7 +246,7 @@ class Builder(object):
       for url in repos_to_setup:
         self._setup_repo(url, repo_versions[url])
 
-    self.bg.set_locked_refs(repo_versions)
+  def save_lockfile(self):
     self.bg.set_deps(self.deps)
     self.bg.save(join(self.code_root, BEGOTTEN_LOCK))
 
@@ -269,12 +272,17 @@ class Builder(object):
     url_hash = hashlib.sha1(url).hexdigest()
     return join(REPO_DIR, url_hash)
 
-  def _resolve_ref(self, url, ref):
+  def _resolve_ref(self, url, ref, updated_set):
     repo_dir = self._repo_dir(url)
     if not os.path.isdir(repo_dir):
-      print "Fetching %s" % url
+      print "Cloning %s" % url
       cc(['git', 'clone', '-q', url, repo_dir], cwd='/')
       cc(['git', 'checkout', '-q', '-b', BEGOT_WORK], cwd=repo_dir)
+    elif updated_set is not None:
+      if url not in updated_set:
+        print "Updating %s" % url
+        cc(['git', 'fetch'], cwd=repo_dir)
+        updated_set.add(url)
 
     try:
       return co(['git', 'rev-parse', '--verify', ref], cwd=repo_dir).strip()
@@ -284,8 +292,7 @@ class Builder(object):
   def _setup_repo(self, url, resolved_ref):
     repo_dir = self._repo_dir(url)
 
-    # TODO: skip reset and rewrite if already done
-    print 'Setting up %s' % url
+    print "Fixing up %s" % url
     cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
     self._rewrite_imports(repo_dir)
 
@@ -342,10 +349,14 @@ class Builder(object):
 def main(argv):
   cmd = argv[0]
   if cmd == 'update':
-    builder = Builder('.', False)
-    builder.setup_repos()
+    builder = Builder('.', use_lockfile=False)
+    builder.setup_repos(update=True)
+    builder.save_lockfile()
+  elif cmd == 'fetch':
+    builder = Builder('.', use_lockfile=True)
+    builder.setup_repos(update=False)
   elif cmd == 'build':
-    builder = Builder('.', True)
+    builder = Builder('.', use_lockfile=True)
     builder.build('./...')
 
 
