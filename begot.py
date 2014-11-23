@@ -20,6 +20,7 @@ There are lots of desirable features in the Go dependency design space:
   - able to use go-gettable dependencies
   - produces go-gettable dependencies
   - no extraneous metadata file
+  - relocatable repos without rewriting imports
   - manages dependent scm repos for you
 
 It is impossible to satisfy all of these at once. That's why there are so many
@@ -45,9 +46,12 @@ be fetched from), but not enough to be complete. The import path lacks:
 
 Most Go depdency tools try to preserve some of the existing properties of import
 paths, which leads to a confusing model and other problems (TODO: elaborate
-here). We'd rather throw them out completely. In begot, dependency import paths
-are all rewritten to use a namespace that doesn't contain any information about
-where to obtain the actual code. That's in an external metadata file. Thus, we
+here). We'd rather throw them out completely. When using begot, you use
+user-chosen import paths that name the package but don't contain any information
+about where to obtain the actual code. That's in an external metadata file.
+Additionally, relative imports within the repo use import paths relative to the
+repo root (as if the repo was directly within "src" in a go workspace), instead
+of including a canonical path to the repo with every import. Thus, we
 immediately see the following advantages and disadvantages:
 
   Pros:
@@ -56,6 +60,8 @@ immediately see the following advantages and disadvantages:
   - you can switch to a custom fork of a dependency with a metadata change
   - no danger of multiple copies of a dependency (as long as no one in the
     dependency tree vendors things with paths rewritten to be within their repo)
+  - repos are trivially relocatable without rewriting imports
+  - you can use relative dependencies without setting up an explicit workspace
 
   Cons:
   - repos are not go-gettable
@@ -98,8 +104,8 @@ TODO: document rigorously!
 TODO: document requesting a specific branch/tag/ref
 
 In your code, you can then refer to these deps with the import path
-"third_party/docker", "third_party/gorilla/mux", etc. and begot will set up the temporary
-workspace correctly.
+"third_party/docker", "third_party/gorilla/mux", etc. and begot will set up the
+temporary workspace correctly.
 
 """
 
@@ -279,6 +285,7 @@ class Builder(object):
       return co(['git', 'rev-parse', '--verify', 'origin/' + ref], cwd=repo_dir).strip()
 
   def _setup_repo(self, url, resolved_ref):
+    hsh = hashlib.sha1(url).hexdigest()[:8]
     repo_dir = self._repo_dir(url)
 
     print "Fixing up %s" % url
@@ -286,9 +293,11 @@ class Builder(object):
 
     # Match up sub-deps to our deps.
     sub_dep_map = {}
+    self_deps = []
     sub_bg_path = join(repo_dir, BEGOTTEN_LOCK)
     if os.path.exists(sub_bg_path):
       sub_bg = Begotten(sub_bg_path)
+      # Add implicit and explicit external dependencies.
       for sub_dep in sub_bg.deps:
         our_dep = self._lookup_dep_by_git_url_and_path(
             sub_dep.git_url, sub_dep.subpath)
@@ -302,22 +311,41 @@ class Builder(object):
           # Include a hash of this repo identifier so that if two repos use the
           # same dep name to refer to two different things, they don't conflict
           # when we flatten deps.
-          hsh = hashlib.sha1(url).hexdigest()[:8]
-          transitive_name = '_begot_transitive/%s/%s' % (hsh, sub_dep.name)
+          transitive_name = '_begot_transitive_%s/%s' % (hsh, sub_dep.name)
           sub_dep_map[sub_dep.name] = transitive_name
           sub_dep.name = transitive_name
           self.deps.append(sub_dep)
+      # Allow relative import paths within this repo.
+      for dirpath, dirnames, files in os.walk(repo_dir):
+        dirnames[:] = filter(lambda n: n[0] != '.', dirnames)
+        for dn in dirnames:
+          relpath = join(dirpath, dn)[len(repo_dir)+1:]
+          our_dep = self._lookup_dep_by_git_url_and_path(url, relpath)
+          if our_dep is not None:
+            sub_dep_map[relpath] = our_dep.name
+          else:
+            # See comment on _lookup_dep_name for re.sub rationale.
+            self_name = '_begot_self_%s/%s' % (hsh, re.sub(r'\W', '_', relpath))
+            sub_dep_map[relpath] = self_name
+            self_deps.append(Dep(name=self_name,
+              git_url=url, subpath=relpath, ref=resolved_ref, aliases=[]))
 
-    self._rewrite_imports(repo_dir, sub_dep_map)
+    used_rewrites = {}
+    self._rewrite_imports(repo_dir, sub_dep_map, used_rewrites)
 
-  def _rewrite_imports(self, repo_dir, sub_dep_map):
-    for dirpath, _, files in os.walk(repo_dir):
+    # Add only the self-deps that were used, to reduce clutter.
+    vals = set(used_rewrites.values())
+    self.deps.extend(dep for dep in self_deps if dep.name in vals)
+
+  def _rewrite_imports(self, repo_dir, sub_dep_map, used_rewrites):
+    for dirpath, dirnames, files in os.walk(repo_dir):
+      dirnames[:] = filter(lambda n: n[0] != '.', dirnames)
       for fn in files:
         if not fn.endswith('.go'):
           continue
-        self._rewrite_file(join(dirpath, fn), sub_dep_map)
+        self._rewrite_file(join(dirpath, fn), sub_dep_map, used_rewrites)
 
-  def _rewrite_file(self, path, sub_dep_map):
+  def _rewrite_file(self, path, sub_dep_map, used_rewrites):
     # TODO: Ew ew ew.. do this using the go parser.
     code = open(path).read().splitlines(True)
     inimports = False
@@ -330,14 +358,14 @@ class Builder(object):
       elif line.startswith('import '):
         rewrite = True
       if rewrite:
-        code[i] = self._rewrite_line(line, sub_dep_map)
+        code[i] = self._rewrite_line(line, sub_dep_map, used_rewrites)
     open(path, 'w').write(''.join(code))
 
-  def _rewrite_line(self, line, sub_dep_map):
+  def _rewrite_line(self, line, sub_dep_map, used_rewrites):
     def repl(m):
       imp = m.group(1)
       if imp in sub_dep_map:
-        imp = sub_dep_map[imp]
+        imp = used_rewrites[imp] = sub_dep_map[imp]
       else:
         parts = imp.split('/')
         if parts[0] in KNOWN_GIT_SERVERS:
@@ -352,7 +380,9 @@ class Builder(object):
       if imp in dep.aliases:
         return dep.name
 
-    #print "Found implicit dependency %s" % imp
+    # Each dep turns into a symlink at build time. Packages can be nested, so we
+    # might depend on 'a' and 'a/b'. If we create a symlink for 'a', we can't
+    # also create 'a/b'. So rename it to 'a_b'.
     name = '_begot_implicit/' + re.sub(r'\W', '_', imp)
     self._add_implicit_dep(name, imp)
     return name
