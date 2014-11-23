@@ -256,6 +256,8 @@ class Builder(object):
       for url in repos_to_setup:
         self._setup_repo(url, repo_versions[url])
 
+    return self
+
   def save_lockfile(self):
     self.bg.set_deps(self.deps)
     self.bg.save(join(self.code_root, BEGOTTEN_LOCK))
@@ -288,7 +290,7 @@ class Builder(object):
     hsh = hashlib.sha1(url).hexdigest()[:8]
     repo_dir = self._repo_dir(url)
 
-    print "Fixing up %s" % url
+    print "Fixing imports in %s" % url
     cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
 
     # Match up sub-deps to our deps.
@@ -441,9 +443,9 @@ class Builder(object):
 def main(argv):
   cmd = argv[0]
   if cmd == 'update':
-    builder = Builder(use_lockfile=False)
-    builder.setup_repos(update=True)
-    builder.save_lockfile()
+    Builder(use_lockfile=False).setup_repos(update=True).save_lockfile()
+  elif cmd == 'rewrite':
+    Builder(use_lockfile=False).setup_repos(update=False).save_lockfile()
   elif cmd == 'fetch':
     Builder().setup_repos(update=False)
   elif cmd == 'build':
