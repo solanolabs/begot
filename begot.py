@@ -282,9 +282,11 @@ class Builder(object):
         updated_set.add(url)
 
     try:
-      return co(['git', 'rev-parse', '--verify', ref], cwd=repo_dir).strip()
+      return co(['git', 'rev-parse', '--verify', 'origin/' + ref],
+          cwd=repo_dir, stderr=open('/dev/null', 'w')).strip()
     except subprocess.CalledProcessError:
-      return co(['git', 'rev-parse', '--verify', 'origin/' + ref], cwd=repo_dir).strip()
+      return co(['git', 'rev-parse', '--verify', ref],
+          cwd=repo_dir, stderr=open('/dev/null', 'w')).strip()
 
   def _setup_repo(self, url, resolved_ref):
     hsh = hashlib.sha1(url).hexdigest()[:8]
