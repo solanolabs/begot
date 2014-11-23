@@ -200,7 +200,11 @@ class Begotten(object):
       yield Begotten.parse_dep(name, val)
 
   def set_deps(self, deps):
-    self.raw['deps'] = dict((dep.name, dep) for dep in deps)
+    def without_name(dep):
+      dep = dict(dep)
+      dep.pop('name')
+      return dep
+    self.raw['deps'] = dict((dep.name, without_name(dep)) for dep in deps)
 
 
 class Builder(object):
@@ -279,16 +283,41 @@ class Builder(object):
 
     print "Fixing up %s" % url
     cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
-    self._rewrite_imports(repo_dir)
 
-  def _rewrite_imports(self, repo_dir):
+    # Match up sub-deps to our deps.
+    sub_dep_map = {}
+    sub_bg_path = join(repo_dir, BEGOTTEN_LOCK)
+    if os.path.exists(sub_bg_path):
+      sub_bg = Begotten(sub_bg_path)
+      for sub_dep in sub_bg.deps:
+        our_dep = self._lookup_dep_by_git_url_and_path(
+            sub_dep.git_url, sub_dep.subpath)
+        if our_dep is not None:
+          if sub_dep.ref != our_dep.ref:
+            raise DependencyError(
+                "Conflict: %s depends on %s at %s, we depend on it at %s",
+                url, sub_dep.git_url, sub_dep.ref, our_dep.ref)
+          sub_dep_map[sub_dep.name] = our_dep.name
+        else:
+          # Include a hash of this repo identifier so that if two repos use the
+          # same dep name to refer to two different things, they don't conflict
+          # when we flatten deps.
+          hsh = hashlib.sha1(url).hexdigest()[:8]
+          transitive_name = '_begot_transitive/%s/%s' % (hsh, sub_dep.name)
+          sub_dep_map[sub_dep.name] = transitive_name
+          sub_dep.name = transitive_name
+          self.deps.append(sub_dep)
+
+    self._rewrite_imports(repo_dir, sub_dep_map)
+
+  def _rewrite_imports(self, repo_dir, sub_dep_map):
     for dirpath, _, files in os.walk(repo_dir):
       for fn in files:
         if not fn.endswith('.go'):
           continue
-        self._rewrite_file(join(dirpath, fn))
+        self._rewrite_file(join(dirpath, fn), sub_dep_map)
 
-  def _rewrite_file(self, path):
+  def _rewrite_file(self, path, sub_dep_map):
     # TODO: Ew ew ew.. do this using the go parser.
     code = open(path).read().splitlines(True)
     inimports = False
@@ -301,17 +330,20 @@ class Builder(object):
       elif line.startswith('import '):
         rewrite = True
       if rewrite:
-        code[i] = self._rewrite_line(line)
+        code[i] = self._rewrite_line(line, sub_dep_map)
     open(path, 'w').write(''.join(code))
 
-  def _rewrite_line(self, line):
+  def _rewrite_line(self, line, sub_dep_map):
     def repl(m):
       imp = m.group(1)
-      parts = imp.split('/')
-      if parts[0] in KNOWN_GIT_SERVERS:
-        dep_name = self._lookup_dep_name(imp)
-        if dep_name is not None:
-          imp = dep_name
+      if imp in sub_dep_map:
+        imp = sub_dep_map[imp]
+      else:
+        parts = imp.split('/')
+        if parts[0] in KNOWN_GIT_SERVERS:
+          dep_name = self._lookup_dep_name(imp)
+          if dep_name is not None:
+            imp = dep_name
       return '"%s"' % imp
     return re.sub(r'"([^"]+)"', repl, line)
 
@@ -325,7 +357,14 @@ class Builder(object):
     self._add_implicit_dep(name, imp)
     return name
 
+  def _lookup_dep_by_git_url_and_path(self, git_url, subpath):
+    for dep in self.deps:
+      if dep.git_url == git_url and dep.subpath == subpath:
+        return dep
+
   def run(self, *args):
+    # TODO: ensure all repos are at right refs
+
     # Set up code_wk.
     cbin = join(self.code_wk, 'bin')
     depsrc = join(self.dep_wk, 'src')
