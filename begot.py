@@ -130,6 +130,9 @@ DEP_WORKSPACE_DIR = join(BEGOT_CACHE, 'depwk')
 CODE_WORKSPACE_DIR = join(BEGOT_CACHE, 'wk')
 REPO_DIR = join(BEGOT_CACHE, 'repo')
 
+# TODO: only one begot process should be messing around in BEGOT_CACHE at a
+# time. use a lockfile.
+
 
 class BegottenFileError(Exception): pass
 class DependencyError(Exception): pass
@@ -226,7 +229,15 @@ class Builder(object):
     self.bg = Begotten(fn)
     self.deps = list(self.bg.deps)
 
+  @property
+  def _all_repos(self):
+    repos = {}
+    for dep in self.deps:
+      repos[dep.git_url] = dep.ref
+    return repos
+
   def setup_repos(self, update):
+    # Should only be called when loaded from Begotten, not lockfile.
     processed_deps = 0
     repo_versions = {}
     if update:
@@ -259,8 +270,10 @@ class Builder(object):
     return self
 
   def save_lockfile(self):
+    # Should only be called when loaded from Begotten, not lockfile.
     self.bg.set_deps(self.deps)
     self.bg.save(join(self.code_root, BEGOTTEN_LOCK))
+    return self
 
   def _add_implicit_dep(self, name, val):
     self.deps.append(Begotten.parse_dep(name, val))
@@ -336,6 +349,8 @@ class Builder(object):
 
     used_rewrites = {}
     self._rewrite_imports(repo_dir, sub_dep_map, used_rewrites)
+    msg = 'rewritten by begot for %s' % self.code_root
+    cc(['git', 'commit', '--allow-empty', '-a', '-q', '-m', msg], cwd=repo_dir)
 
     # Add only the self-deps that were used, to reduce clutter.
     vals = set(used_rewrites.values())
@@ -345,9 +360,8 @@ class Builder(object):
     for dirpath, dirnames, files in os.walk(repo_dir):
       dirnames[:] = filter(lambda n: n[0] != '.', dirnames)
       for fn in files:
-        if not fn.endswith('.go'):
-          continue
-        self._rewrite_file(join(dirpath, fn), sub_dep_map, used_rewrites)
+        if fn.endswith('.go'):
+          self._rewrite_file(join(dirpath, fn), sub_dep_map, used_rewrites)
 
   def _rewrite_file(self, path, sub_dep_map, used_rewrites):
     # TODO: Ew ew ew.. do this using the go parser.
@@ -396,8 +410,24 @@ class Builder(object):
       if dep.git_url == git_url and dep.subpath == subpath:
         return dep
 
+  def tag_repos(self):
+    # Run this after setup_repos.
+    for url, ref in self._all_repos.iteritems():
+      cc(['git', 'tag', '--force', self._tag_hash(ref)], cwd=self._repo_dir(url))
+
+  def _tag_hash(self, ref, cached_lf_hash=[]):
+    # We want to tag the current state with a name that depends on:
+    # 1. The base ref that we rewrote from.
+    # 2. The full set of deps that describe how we rewrote imports.
+    # The contents of Begotten.lock suffice for (2):
+    if not cached_lf_hash:
+      lockfile = join(self.code_root, BEGOTTEN_LOCK)
+      cached_lf_hash.append(hashlib.sha1(file(lockfile).read()).hexdigest())
+    lf_hash = cached_lf_hash[0]
+    return '_begot_rewrote_' + hashlib.sha1(ref + lf_hash).hexdigest()
+
   def run(self, *args):
-    # TODO: ensure all repos are at right refs
+    self._reset_to_tags()
 
     # Set up code_wk.
     cbin = join(self.code_wk, 'bin')
@@ -430,6 +460,10 @@ class Builder(object):
     os.chdir(self.code_root)
     os.execvp(args[0], args)
 
+  def _reset_to_tags(self):
+    for url, ref in self._all_repos.iteritems():
+      cc(['git', 'reset', '-q', '--hard', 'tags/' + self._tag_hash(ref)], cwd=self._repo_dir(url))
+
   def _setup_dep(self, dep):
     path = join(self.dep_wk, 'src', dep.name)
     target = join(self._repo_dir(dep.git_url), dep.subpath)
@@ -445,17 +479,17 @@ class Builder(object):
 def main(argv):
   cmd = argv[0]
   if cmd == 'update':
-    Builder(use_lockfile=False).setup_repos(update=True).save_lockfile()
+    Builder(use_lockfile=False).setup_repos(update=True).save_lockfile().tag_repos()
   elif cmd == 'rewrite':
-    Builder(use_lockfile=False).setup_repos(update=False).save_lockfile()
+    Builder(use_lockfile=False).setup_repos(update=False).save_lockfile().tag_repos()
   elif cmd == 'fetch':
-    Builder().setup_repos(update=False)
+    Builder(use_lockfile=True).setup_repos(update=False).tag_repos()
   elif cmd == 'build':
-    Builder().run('go', 'install', './...')
+    Builder(use_lockfile=True).run('go', 'install', './...')
   elif cmd == 'go':
-    Builder().run('go', *argv[1:])
+    Builder(use_lockfile=True).run('go', *argv[1:])
   elif cmd == 'exec':
-    Builder().run(*argv[1:])
+    Builder(use_lockfile=True).run(*argv[1:])
   elif cmd == 'clean':
     Builder(use_lockfile=False).clean()
   else:
