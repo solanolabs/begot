@@ -109,7 +109,7 @@ temporary workspace correctly.
 
 """
 
-import sys, os, re, subprocess, argparse, yaml, hashlib, collections, errno, shutil
+import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, yaml
 
 BEGOTTEN = 'Begotten'
 BEGOTTEN_LOCK = 'Begotten.lock'
@@ -129,9 +129,7 @@ BEGOT_CACHE = os.getenv('BEGOT_CACHE') or join(HOME, '.cache', 'begot')
 DEP_WORKSPACE_DIR = join(BEGOT_CACHE, 'depwk')
 CODE_WORKSPACE_DIR = join(BEGOT_CACHE, 'wk')
 REPO_DIR = join(BEGOT_CACHE, 'repo')
-
-# TODO: only one begot process should be messing around in BEGOT_CACHE at a
-# time. use a lockfile.
+CACHE_LOCK = join(BEGOT_CACHE, 'lock')
 
 
 class BegottenFileError(Exception): pass
@@ -476,7 +474,20 @@ class Builder(object):
     _rm(join(self.code_root, 'bin'))
 
 
+def lock_cache():
+  try:
+    global _cache_lock
+    _cache_lock = file(CACHE_LOCK, 'w')
+    fcntl.flock(_cache_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Leave file open for lifetime of this process and anything exec'd by this
+    # process.
+  except IOError:
+    print >>sys.stderr, "Can't lock %r" % BEGOT_CACHE
+    sys.exit(1)
+
+
 def main(argv):
+  lock_cache()
   cmd = argv[0]
   if cmd == 'update':
     Builder(use_lockfile=False).setup_repos(update=True).save_lockfile().tag_repos()
