@@ -1,6 +1,6 @@
 #!/usr/bin/env python2
 
-"""
+r"""
 
 Begot is a different approach to managing Go dependencies.
 
@@ -96,7 +96,7 @@ A Begotten file is in yaml format and looks roughly like this:
       git_url: git@github.com:solanolabs/tddium_go
       subpath: client
 
-Things to note:
+Notes:
 - A plain string is shorthand for {"import_path": ...}
 - You can override the git url used, in a single place, which will apply to the
   whole project and all of its dependencies.
@@ -175,6 +175,9 @@ Subcommands:
         endif
       endfunction
       call SetBegotGoPath()
+
+  begot help:
+    1. Prints this text.
 
 """
 
@@ -589,6 +592,8 @@ def main(argv):
     if gopath is None:
       sys.exit(1)
     print gopath
+  elif cmd == 'help':
+    print __doc__.split('---\n')[-1],
   else:
     raise Exception("Unknown subcommand %r" % cmd)
 
