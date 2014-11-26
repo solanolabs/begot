@@ -113,7 +113,6 @@ import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, yaml
 
 BEGOTTEN = 'Begotten'
 BEGOTTEN_LOCK = 'Begotten.lock'
-BEGOT_WORK = '__begot_work__'
 
 # Known public servers and how many path components form the repo name.
 KNOWN_GIT_SERVERS = {
@@ -285,7 +284,9 @@ class Builder(object):
     if not os.path.isdir(repo_dir):
       print "Cloning %s" % url
       cc(['git', 'clone', '-q', url, repo_dir], cwd='/')
-      cc(['git', 'checkout', '-q', '-b', BEGOT_WORK], cwd=repo_dir)
+      # Get into detached head state so we can manipulate things without
+      # worrying about messing up a branch.
+      cc(['git', 'checkout', '-q', '--detach'], cwd=repo_dir)
     elif updated_set is not None:
       if url not in updated_set:
         print "Updating %s" % url
