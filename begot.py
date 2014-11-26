@@ -561,6 +561,7 @@ def get_gopath(code_root='.'):
 def lock_cache():
   try:
     global _cache_lock
+    _mkdir_p(BEGOT_CACHE)
     _cache_lock = file(CACHE_LOCK, 'w')
     fcntl.flock(_cache_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     # Leave file open for lifetime of this process and anything exec'd by this
