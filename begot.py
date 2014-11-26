@@ -84,12 +84,13 @@ temporary workspace created by begot, along with your dependencies.
 A Begotten file is in yaml format and looks roughly like this:
 
   deps:
-    third_party/docker: github.com/fsouza/go-dockerclient
     third_party/systemstat: bitbucket.org/bertimus9/systemstat
-    third_party/gorilla/mux:
-      import_path: github.com/gorilla/mux
+    third_party/gorilla/mux: github.com/gorilla/mux
+    third_party/docker:
+      import_path: github.com/fsouza/go-dockerclient
+      ref: 0.2.1
     tddium/util:
-      git_repo: git@github.com:solanolabs/tddium_go
+      git_url: git@github.com:solanolabs/tddium_go
       subpath: util
     tddium/client:
       git_url: git@github.com:solanolabs/tddium_go
@@ -99,13 +100,81 @@ Things to note:
 - A plain string is shorthand for {"import_path": ...}
 - You can override the git url used, in a single place, which will apply to the
   whole project and all of its dependencies.
-
-TODO: document rigorously!
-TODO: document requesting a specific branch/tag/ref
+- You can refer to a branch, tag, or commit hash, using the 'ref' option (which
+  defaults to 'master').
+- Using ssh-style git urls allows using private repos easily.
 
 In your code, you can then refer to these deps with the import path
 "third_party/docker", "third_party/gorilla/mux", etc. and begot will set up the
 temporary workspace correctly.
+
+Subcommands:
+
+  begot update:
+    1. Reads Begotten
+    2. Fetches (and updates) transitive dependencies
+    3. (Re-)resolves references
+    4. Rewrites imports in dependencies
+    5. writes locked references to Begotten.lock
+
+    Use this when:
+    - You've just written a new Begotten file.
+    - You want to bump the version of all dependencies (when you've requested
+      'master' or another branch).
+
+  begot just_rewrite:
+    Does what 'begot update' does except does not fetch new code if the
+    dependency is already present in the cache.
+
+    In general, you shouldn't need to use this. Prefer 'begot update' or 'begot
+    fetch', as appropriate. This is useful if something has changed about the
+    way begot rewrites dependencies and you want to fix it without bumping
+    versions.
+
+  begot fetch:
+    1. Reads Begotten.lock
+    2. Fetches transitive dependencies
+    3. Rewrites imports in dependencies
+
+    Use this when:
+    - You've just cloned or updated your code repo and you want to get the
+      dependencies required for building.
+
+  begot build/go/exec:
+    1. Reads Begotten.lock
+    2. Ensures the dependency repos are at the correct revisions and have
+       correctly-rewritten imports
+    3. Sets up a symlink from 'bin' in the current directory to 'bin' in the
+       first go workspace in GOPATH, i.e., the place where 'go install' will put
+       binaries.
+    4. Runs the given command in a go workspace with the dependencies specified
+       in Begotten.lock. 'begot go' is a shorthand for 'begot exec go', and
+       'begot build' is a shorthand for 'begot go install ./...'. In short:
+         begot build         runs   go install ./...
+         begot go <args>     runs   go <args>
+         begot exec <args>   runs   <args>
+
+    Use this when:
+    - You want to build your project.
+
+  begot clean:
+    1. Removes the temprary workspaces, including built binaries.
+
+  begot gopath:
+    1. Prints the GOPATH that would be used for 'begot build' (except skipping
+       most of the work).
+
+    Use this from shell or editor hooks.
+
+    Here's some sample vim script:
+
+      function! SetBegotGoPath()
+        let gopath = substitute(system("begot gopath"), "\n", "", "")
+        if v:shell_error == 0
+          let $GOPATH = gopath
+        endif
+      endfunction
+      call SetBegotGoPath()
 
 """
 
@@ -198,7 +267,6 @@ class Begotten(object):
     return Dep(name=name, git_url=val['git_url'], subpath=val['subpath'],
         ref=val['ref'], aliases=val['aliases'])
 
-  @property
   def deps(self):
     if 'deps' not in self.raw:
       raise BegottenFileError("Missing 'deps' section")
@@ -217,16 +285,15 @@ class Builder(object):
   def __init__(self, code_root='.', use_lockfile=True):
     self.code_root = os.path.realpath(code_root)
     hsh = hashlib.sha1(self.code_root).hexdigest()[:8]
-    self.dep_wk = join(DEP_WORKSPACE_DIR, hsh)
     self.code_wk = join(CODE_WORKSPACE_DIR, hsh)
+    self.dep_wk = join(DEP_WORKSPACE_DIR, hsh)
     if use_lockfile:
       fn = join(self.code_root, BEGOTTEN_LOCK)
     else:
       fn = join(self.code_root, BEGOTTEN)
     self.bg = Begotten(fn)
-    self.deps = list(self.bg.deps)
+    self.deps = list(self.bg.deps())
 
-  @property
   def _all_repos(self):
     repos = {}
     for dep in self.deps:
@@ -314,7 +381,7 @@ class Builder(object):
     if os.path.exists(sub_bg_path):
       sub_bg = Begotten(sub_bg_path)
       # Add implicit and explicit external dependencies.
-      for sub_dep in sub_bg.deps:
+      for sub_dep in sub_bg.deps():
         our_dep = self._lookup_dep_by_git_url_and_path(
             sub_dep.git_url, sub_dep.subpath)
         if our_dep is not None:
@@ -411,7 +478,7 @@ class Builder(object):
 
   def tag_repos(self):
     # Run this after setup_repos.
-    for url, ref in self._all_repos.iteritems():
+    for url, ref in self._all_repos().iteritems():
       cc(['git', 'tag', '--force', self._tag_hash(ref)], cwd=self._repo_dir(url))
 
   def _tag_hash(self, ref, cached_lf_hash=[]):
@@ -460,7 +527,7 @@ class Builder(object):
     os.execvp(args[0], args)
 
   def _reset_to_tags(self):
-    for url, ref in self._all_repos.iteritems():
+    for url, ref in self._all_repos().iteritems():
       cc(['git', 'reset', '-q', '--hard', 'tags/' + self._tag_hash(ref)], cwd=self._repo_dir(url))
 
   def _setup_dep(self, dep):
@@ -473,6 +540,19 @@ class Builder(object):
     shutil.rmtree(self.dep_wk, ignore_errors=True)
     shutil.rmtree(self.code_wk, ignore_errors=True)
     _rm(join(self.code_root, 'bin'))
+
+
+def get_gopath(code_root='.'):
+  # This duplicates logic in Builder, but we want to just get the GOPATH without
+  # parsing anything.
+  while not os.path.exists(BEGOTTEN):
+    if os.getcwd() == '/':
+      return None
+    os.chdir('..')
+  hsh = hashlib.sha1(os.path.realpath('.')).hexdigest()[:8]
+  code_wk = join(CODE_WORKSPACE_DIR, hsh)
+  dep_wk = join(DEP_WORKSPACE_DIR, hsh)
+  return ':'.join((code_wk, dep_wk))
 
 
 def lock_cache():
@@ -492,7 +572,7 @@ def main(argv):
   cmd = argv[0]
   if cmd == 'update':
     Builder(use_lockfile=False).setup_repos(update=True).save_lockfile().tag_repos()
-  elif cmd == 'rewrite':
+  elif cmd == 'just_rewrite':
     Builder(use_lockfile=False).setup_repos(update=False).save_lockfile().tag_repos()
   elif cmd == 'fetch':
     Builder(use_lockfile=True).setup_repos(update=False).tag_repos()
@@ -504,6 +584,11 @@ def main(argv):
     Builder(use_lockfile=True).run(*argv[1:])
   elif cmd == 'clean':
     Builder(use_lockfile=False).clean()
+  elif cmd == 'gopath':
+    gopath = get_gopath()
+    if gopath is None:
+      sys.exit(1)
+    print gopath
   else:
     raise Exception("Unknown subcommand %r" % cmd)
 
