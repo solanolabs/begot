@@ -502,7 +502,12 @@ class Builder(object):
     cbin = join(self.code_wk, 'bin')
     depsrc = join(self.dep_wk, 'src')
     _mkdir_p(cbin, depsrc)
-    _ln_sf(cbin, join(self.code_root, 'bin'))
+    try:
+      _ln_sf(cbin, join(self.code_root, 'bin'))
+    except OSError:
+      print >>sys.stderr, "It looks like you have an existing 'bin' directory."
+      print >>sys.stderr, "Please remove it before using begot."
+      sys.exit(1)
     _ln_sf(self.code_root, join(self.code_wk, 'src'))
 
     old_deps = set(co(['find', depsrc, '-type', 'l', '-print0']).split('\0'))
