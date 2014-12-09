@@ -576,9 +576,19 @@ def lock_cache():
     sys.exit(1)
 
 
+def print_help(ret=1):
+  print __doc__.split('---\n')[-1],
+  sys.exit(ret)
+
+
 def main(argv):
   lock_cache()
-  cmd = argv[0]
+
+  try:
+    cmd = argv[0]
+  except IndexError:
+    print_help()
+
   if cmd == 'update':
     Builder(use_lockfile=False).setup_repos(update=True).save_lockfile().tag_repos()
   elif cmd == 'just_rewrite':
@@ -599,9 +609,10 @@ def main(argv):
       sys.exit(1)
     print gopath
   elif cmd == 'help':
-    print __doc__.split('---\n')[-1],
+    print_help(0)
   else:
-    raise Exception("Unknown subcommand %r" % cmd)
+    print >>sys.stderr, "Unknown subcommand %r" % cmd
+    print_help()
 
 
 if __name__ == '__main__':
