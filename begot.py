@@ -69,9 +69,17 @@ immediately see the following advantages and disadvantages:
 
 Begot also adds some amount of transparent scm repo management, since we do need
 to rewrite import paths, and if we're rewriting code, we should use an scm
-system to track those changes. Rather than vendoring source within a single
-repo, it maintains a family of repos (within a GitHub organization) for better
-code sharing.
+system to track those changes.
+
+---
+
+Currently, the fear that a particular dependency or version of a dependency will
+become unavailable and a build no longer reproducible leads to the practice of
+vendoring dependencies within a project repo. Instead of combining multiple
+logical repos into one (and discarding history and metadata), our approach is to
+combine begot with another tool that manages mirrors of third-party dependencies
+in scm hosting that you control, e.g. forks within your own github organization.
+(This other tool doesn't exist yet.)
 
 ---
 
