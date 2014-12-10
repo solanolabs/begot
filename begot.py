@@ -329,8 +329,8 @@ class Builder(object):
         if have is not None:
           if have != want:
             raise DependencyError(
-                "Conflicting versions for %r: have %s, want %s (%s)",
-                dep.name, have, want, dep.ref)
+                "Conflicting versions for %r: have %s, want %s (%s)" % (
+                dep.name, have, want, dep.ref))
         else:
           repo_versions[dep.git_url] = want
           repos_to_setup.append(dep.git_url)
@@ -398,8 +398,8 @@ class Builder(object):
         if our_dep is not None:
           if sub_dep.ref != our_dep.ref:
             raise DependencyError(
-                "Conflict: %s depends on %s at %s, we depend on it at %s",
-                url, sub_dep.git_url, sub_dep.ref, our_dep.ref)
+                "Conflict: %s depends on %s at %s, we depend on it at %s" % (
+                url, sub_dep.git_url, sub_dep.ref, our_dep.ref))
           sub_dep_map[sub_dep.name] = our_dep.name
         else:
           # Include a hash of this repo identifier so that if two repos use the
