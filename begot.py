@@ -158,12 +158,14 @@ Subcommands:
     4. Runs the given command in a go workspace with the dependencies specified
        in Begotten.lock. 'begot go' is a shorthand for 'begot exec go', and
        'begot build' is a shorthand for 'begot go install ./...'. In short:
-         begot build         runs   go install ./...
+         begot build         runs   go install ./...   [*]
          begot go <args>     runs   go <args>
          begot exec <args>   runs   <args>
 
     Use this when:
     - You want to build your project.
+
+    [*]: This is actually slightly more complicated. See comments in Builder.run
 
   begot clean:
     1. Removes the temprary workspaces, including built binaries.
@@ -193,6 +195,7 @@ import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, yaml
 
 BEGOTTEN = 'Begotten'
 BEGOTTEN_LOCK = 'Begotten.lock'
+EMPTY_DEP = '_begot_empty_dep'
 
 # Known public servers and how many path components form the repo name.
 KNOWN_GIT_SERVERS = {
@@ -509,7 +512,8 @@ class Builder(object):
     # Set up code_wk.
     cbin = join(self.code_wk, 'bin')
     depsrc = join(self.dep_wk, 'src')
-    _mkdir_p(cbin, depsrc)
+    empty_dep = join(depsrc, EMPTY_DEP)
+    _mkdir_p(cbin, empty_dep)
     try:
       _ln_sf(cbin, join(self.code_root, 'bin'))
     except OSError:
@@ -536,6 +540,25 @@ class Builder(object):
         except OSError, e:
           if e.errno != errno.ENOTEMPTY:
             raise
+
+    # Set up empty dep.
+    #
+    # The go tool tries to be helpful by not rebuilding modified code if that
+    # code is in a workspace and no packages from that workspace are mentioned
+    # on the command line. See cmd/go/pkg.go:isStale around line 680.
+    #
+    # We are explicitly managing all of the workspaces in our GOPATH and do
+    # indeed want to rebuild everything when dependencies change. That is
+    # required by the goal of reproducible builds: the alternative would mean
+    # what you get for this build depends on the state of a previous build.
+    #
+    # The go tool doesn't provide any way of disabling this "helpful"
+    # functionality. The simplest workaround is to always mention a package from
+    # the dependency workspace on the command line. Hence, we add an empty
+    # package.
+    empty_go = join(empty_dep, 'empty.go')
+    if not os.path.isfile(empty_go):
+      open(empty_go, 'w').write('package %s\n' % EMPTY_DEP)
 
     # Overwrite any existing GOPATH.
     os.putenv('GOPATH', ':'.join((self.code_wk, self.dep_wk)))
@@ -604,7 +627,7 @@ def main(argv):
   elif cmd == 'fetch':
     Builder(use_lockfile=True).setup_repos(update=False).tag_repos()
   elif cmd == 'build':
-    Builder(use_lockfile=True).run('go', 'install', './...')
+    Builder(use_lockfile=True).run('go', 'install', './...', EMPTY_DEP)
   elif cmd == 'go':
     Builder(use_lockfile=True).run('go', *argv[1:])
   elif cmd == 'exec':
