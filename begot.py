@@ -328,6 +328,13 @@ class Builder(object):
 
       for dep in self.deps[processed_deps:]:
         have = repo_versions.get(dep.git_url)
+
+        if dep.name.startswith('_begot_implicit/') and have is not None:
+          # Implicit deps take the revision of an explicit dep from the same
+          # repo, if one exists.
+          dep.ref = have
+          continue
+
         want = self._resolve_ref(dep.git_url, dep.ref, updated_set)
         if have is not None:
           if have != want:
