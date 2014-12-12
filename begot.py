@@ -203,6 +203,14 @@ BEGOTTEN = 'Begotten'
 BEGOTTEN_LOCK = 'Begotten.lock'
 EMPTY_DEP = '_begot_empty_dep'
 
+# This is an identifier for the version of begot. It gets written into
+# Begotten.lock.
+CODE_VERSION = 'begot-1.0-' + hashlib.sha1(open(__file__).read()).hexdigest()[:8]
+
+# This should change if the format of Begotten.lock changes in an incompatible
+# way. (But prefer changing it in compatible ways and not incrementing this.)
+FILE_VERSION = 1
+
 # Known public servers and how many path components form the repo name.
 KNOWN_GIT_SERVERS = {
   'github.com': 2,
@@ -249,8 +257,16 @@ yaml.add_representer(Dep, yaml.representer.Representer.represent_dict)
 class Begotten(object):
   def __init__(self, fn):
     self.raw = yaml.safe_load(open(fn))
+    file_version = self.raw.get('meta', {}).get('file_version')
+    if file_version is not None and file_version != FILE_VERSION:
+      raise BegottenFileError(
+          "Incompatible file version for %r; please run 'begot update'." % fn)
 
   def save(self, fn):
+    self.raw.setdefault('meta', {}).update({
+      'file_version': FILE_VERSION,
+      'generated_by': CODE_VERSION,
+    })
     yaml.dump(self.raw, open(fn, 'w'), default_flow_style=False)
 
   def default_git_url_from_repo_path(self, repo_path):
@@ -332,7 +348,11 @@ class Builder(object):
       fn = join(self.code_root, BEGOTTEN_LOCK)
     else:
       fn = join(self.code_root, BEGOTTEN)
-    self.bg = Begotten(fn)
+    try:
+      self.bg = Begotten(fn)
+    except BegottenFileError, e:
+      print >>sys.stderr, e
+      sys.exit(1)
     self.deps = self.bg.deps()
     self.repo_deps = self.bg.repo_deps()
 
@@ -345,6 +365,9 @@ class Builder(object):
       bg_lock = Begotten(join(self.code_root, BEGOTTEN_LOCK))
     except IOError:
       print >>sys.stderr, "You must have a %s to do a limited update." % BEGOTTEN_LOCK
+      sys.exit(1)
+    except BegottenFileError, e:
+      print >>sys.stderr, e
       sys.exit(1)
     deps = bg_lock.deps()
     repo_deps = bg_lock.repo_deps()
