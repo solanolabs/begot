@@ -596,7 +596,12 @@ class Builder(object):
     return '_begot_rewrote_' + hashlib.sha1(ref + lf_hash).hexdigest()
 
   def run(self, *args):
-    self._reset_to_tags()
+    try:
+      self._reset_to_tags()
+    except subprocess.CalledProcessError:
+      print >>sys.stderr, ("Begotten.lock refers to a missing local commit. "
+          "Run 'begot fetch' first.")
+      sys.exit(1)
 
     # Set up code_wk.
     cbin = join(self.code_wk, 'bin')
