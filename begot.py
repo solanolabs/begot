@@ -197,7 +197,7 @@ Subcommands:
 
 """
 
-import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, yaml
+import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, fnmatch, yaml
 
 BEGOTTEN = 'Begotten'
 BEGOTTEN_LOCK = 'Begotten.lock'
@@ -332,14 +332,27 @@ class Builder(object):
   def _all_repos(self):
     return dict((dep.git_url, dep.ref) for dep in self.deps)
 
-  def setup_repos(self, fetch):
-    # Should only be called when loaded from Begotten, not lockfile.
+  def get_locked_refs_for_update(self, limits):
+    if not limits: return {}
+    try:
+      deps = Begotten(join(self.code_root, BEGOTTEN_LOCK)).deps()
+    except IOError:
+      print >>sys.stderr, "You must have a %s to do a limited update." % BEGOTTEN_LOCK
+      sys.exit(1)
+    match = lambda name: any(fnmatch.fnmatch(name, limit) for limit in limits)
+    repos_to_update = set(dep.git_url for dep in deps if match(dep.name))
+    return dict((dep.git_url, dep.ref) for dep in deps
+                if dep.git_url not in repos_to_update)
+
+  def setup_repos(self, fetch, limits=None):
     processed_deps = 0
     repo_versions = {}
     if fetch:
       fetched_set = set()
     else:
       fetched_set = None
+
+    locked_refs = self.get_locked_refs_for_update(limits)
 
     while processed_deps < len(self.deps):
       repos_to_setup = []
@@ -353,7 +366,10 @@ class Builder(object):
           dep.ref = have
           continue
 
-        want = self._resolve_ref(dep.git_url, dep.ref, fetched_set)
+        want = locked_refs.get(dep.git_url)
+        if want is None:
+          want = self._resolve_ref(dep.git_url, dep.ref, fetched_set)
+
         if have is not None:
           if have != want:
             raise DependencyError(
@@ -646,7 +662,7 @@ def main(argv):
     print_help()
 
   if cmd == 'update':
-    Builder(use_lockfile=False).setup_repos(fetch=True).save_lockfile().tag_repos()
+    Builder(use_lockfile=False).setup_repos(fetch=True, limits=argv[1:]).save_lockfile().tag_repos()
   elif cmd == 'just_rewrite':
     Builder(use_lockfile=False).setup_repos(fetch=False).save_lockfile().tag_repos()
   elif cmd == 'fetch':
