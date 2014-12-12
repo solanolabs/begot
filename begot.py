@@ -97,12 +97,16 @@ A Begotten file is in yaml format and looks roughly like this:
     third_party/docker:
       import_path: github.com/fsouza/go-dockerclient
       ref: 0.2.1
-    tddium/util:
-      git_url: git@github.com:solanolabs/tddium_go
-      subpath: util
+    third_party/goamz/s3: github.com/mitchellh/goamz/s3
+    tddium/util: github.com/solanolabs/tddium_go/util
     tddium/client:
       git_url: git@github.com:solanolabs/tddium_go
       subpath: client
+  repo_aliases:
+    github.com/solanolabs/tddium_go:
+      git_url: git@github.com:solanolabs/tddium_go
+      #ref: some_branch
+    github.com/mitchellh/goamz: github.com/wkj/goamz
 
 Notes:
 - A plain string is shorthand for {"import_path": ...}
@@ -110,6 +114,8 @@ Notes:
   whole project and all of its dependencies.
 - You can refer to a branch, tag, or commit hash, using the 'ref' option (which
   defaults to 'master').
+- You can redirect all packages in a whole repo to another repo, and optionally
+  pin it to a given ref.
 - Using ssh-style git urls allows using private repos easily.
 
 In your code, you can then refer to these deps with the import path
@@ -247,8 +253,13 @@ class Begotten(object):
   def save(self, fn):
     yaml.dump(self.raw, open(fn, 'w'), default_flow_style=False)
 
-  @staticmethod
-  def parse_dep(name, val):
+  def default_git_url_from_repo_path(self, repo_path):
+    return 'https://' + repo_path
+
+  def get_repo_alias(self, repo_path):
+    return self.raw.get('repo_aliases', {}).get(repo_path)
+
+  def parse_dep(self, name, val):
     if isinstance(val, str):
       val = {'import_path': val}
     if not isinstance(val, dict):
@@ -264,9 +275,19 @@ class Begotten(object):
       if repo_parts is None:
         raise BegottenFileError("Unknown git server %r for %r" % (
           parts[0], name))
-      val['git_url'] = 'https://' + '/'.join(parts[:repo_parts+1])
+      repo_path = '/'.join(parts[:repo_parts+1])
+      val['git_url'] = self.default_git_url_from_repo_path(repo_path)
       val['subpath'] = '/'.join(parts[repo_parts+1:])
       val['aliases'].append(val['import_path'])
+
+      # Redirect through repo aliases:
+      alias = self.get_repo_alias(repo_path)
+      if alias is not None:
+        if isinstance(alias, str):
+          alias = {'git_url': self.default_git_url_from_repo_path(alias)}
+        for attr in 'git_url', 'ref':
+          if attr in alias:
+            val[attr] = alias[attr]
 
     if 'git_url' not in val:
       raise BegottenFileError(
@@ -285,7 +306,7 @@ class Begotten(object):
     if 'deps' not in self.raw:
       raise BegottenFileError("Missing 'deps' section")
     for name, val in self.raw['deps'].iteritems():
-      yield Begotten.parse_dep(name, val)
+      yield self.parse_dep(name, val)
 
   def set_deps(self, deps):
     def without_name(dep):
@@ -361,7 +382,7 @@ class Builder(object):
     return self
 
   def _add_implicit_dep(self, name, val):
-    self.deps.append(Begotten.parse_dep(name, val))
+    self.deps.append(self.bg.parse_dep(name, val))
 
   def _repo_dir(self, url):
     url_hash = hashlib.sha1(url).hexdigest()
