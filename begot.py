@@ -315,6 +315,12 @@ class Begotten(object):
       return dep
     self.raw['deps'] = dict((dep.name, without_name(dep)) for dep in deps)
 
+  def repo_deps(self):
+    return self.raw.get('repo_deps', {})
+
+  def set_repo_deps(self, repo_deps):
+    self.raw['repo_deps'] = repo_deps
+
 
 class Builder(object):
   def __init__(self, code_root='.', use_lockfile=True):
@@ -328,6 +334,7 @@ class Builder(object):
       fn = join(self.code_root, BEGOTTEN)
     self.bg = Begotten(fn)
     self.deps = self.bg.deps()
+    self.repo_deps = self.bg.repo_deps()
 
   def _all_repos(self):
     return dict((dep.git_url, dep.ref) for dep in self.deps)
@@ -335,12 +342,19 @@ class Builder(object):
   def get_locked_refs_for_update(self, limits):
     if not limits: return {}
     try:
-      deps = Begotten(join(self.code_root, BEGOTTEN_LOCK)).deps()
+      bg_lock = Begotten(join(self.code_root, BEGOTTEN_LOCK))
     except IOError:
       print >>sys.stderr, "You must have a %s to do a limited update." % BEGOTTEN_LOCK
       sys.exit(1)
+    deps = bg_lock.deps()
+    repo_deps = bg_lock.repo_deps()
     match = lambda name: any(fnmatch.fnmatch(name, limit) for limit in limits)
     repos_to_update = set(dep.git_url for dep in deps if match(dep.name))
+    n = None
+    while len(repos_to_update) != n:
+      n = len(repos_to_update)
+      for repo in list(repos_to_update):
+        repos_to_update.update(repo_deps.get(repo, []))
     return dict((dep.git_url, dep.ref) for dep in deps
                 if dep.git_url not in repos_to_update)
 
@@ -391,11 +405,20 @@ class Builder(object):
   def save_lockfile(self):
     # Should only be called when loaded from Begotten, not lockfile.
     self.bg.set_deps(self.deps)
+    self.bg.set_repo_deps(self.repo_deps)
     self.bg.save(join(self.code_root, BEGOTTEN_LOCK))
     return self
 
   def _add_implicit_dep(self, name, val):
-    self.deps.append(self.bg.parse_dep(name, val))
+    dep = self.bg.parse_dep(name, val)
+    self.deps.append(dep)
+    return dep
+
+  def _record_repo_dep(self, git_url):
+    if self.processing_repo != git_url:
+      lst = self.repo_deps.setdefault(self.processing_repo, [])
+      if git_url not in lst:
+        lst.append(git_url)
 
   def _repo_dir(self, url):
     url_hash = hashlib.sha1(url).hexdigest()
@@ -423,6 +446,7 @@ class Builder(object):
           cwd=repo_dir, stderr=open('/dev/null', 'w')).strip()
 
   def _setup_repo(self, url, resolved_ref):
+    self.processing_repo = url
     hsh = hashlib.sha1(url).hexdigest()[:8]
     repo_dir = self._repo_dir(url)
 
@@ -437,6 +461,7 @@ class Builder(object):
       sub_bg = Begotten(sub_bg_path)
       # Add implicit and explicit external dependencies.
       for sub_dep in sub_bg.deps():
+        self._record_repo_dep(sub_dep.git_url)
         our_dep = self._lookup_dep_by_git_url_and_path(
             sub_dep.git_url, sub_dep.subpath)
         if our_dep is not None:
@@ -508,22 +533,22 @@ class Builder(object):
       else:
         parts = imp.split('/')
         if parts[0] in KNOWN_GIT_SERVERS:
-          dep_name = self._lookup_dep_name(imp)
-          if dep_name is not None:
-            imp = dep_name
+          imp = self._lookup_dep_name(imp)
       return '"%s"' % imp
     return re.sub(r'"([^"]+)"', repl, line)
 
   def _lookup_dep_name(self, imp):
     for dep in self.deps:
       if imp in dep.aliases:
+        self._record_repo_dep(dep.git_url)
         return dep.name
 
     # Each dep turns into a symlink at build time. Packages can be nested, so we
     # might depend on 'a' and 'a/b'. If we create a symlink for 'a', we can't
     # also create 'a/b'. So rename it to 'a_b'.
     name = '_begot_implicit/' + re.sub(r'\W', '_', imp)
-    self._add_implicit_dep(name, imp)
+    dep = self._add_implicit_dep(name, imp)
+    self._record_repo_dep(dep.git_url)
     return name
 
   def _lookup_dep_by_git_url_and_path(self, git_url, subpath):
