@@ -335,14 +335,14 @@ class Builder(object):
       repos[dep.git_url] = dep.ref
     return repos
 
-  def setup_repos(self, update):
+  def setup_repos(self, fetch):
     # Should only be called when loaded from Begotten, not lockfile.
     processed_deps = 0
     repo_versions = {}
-    if update:
-      updated_set = set()
+    if fetch:
+      fetched_set = set()
     else:
-      updated_set = None
+      fetched_set = None
 
     while processed_deps < len(self.deps):
       repos_to_setup = []
@@ -356,7 +356,7 @@ class Builder(object):
           dep.ref = have
           continue
 
-        want = self._resolve_ref(dep.git_url, dep.ref, updated_set)
+        want = self._resolve_ref(dep.git_url, dep.ref, fetched_set)
         if have is not None:
           if have != want:
             raise DependencyError(
@@ -388,7 +388,7 @@ class Builder(object):
     url_hash = hashlib.sha1(url).hexdigest()
     return join(REPO_DIR, url_hash)
 
-  def _resolve_ref(self, url, ref, updated_set):
+  def _resolve_ref(self, url, ref, fetched_set):
     repo_dir = self._repo_dir(url)
     if not os.path.isdir(repo_dir):
       print "Cloning %s" % url
@@ -396,11 +396,11 @@ class Builder(object):
       # Get into detached head state so we can manipulate things without
       # worrying about messing up a branch.
       cc(['git', 'checkout', '-q', '--detach'], cwd=repo_dir)
-    elif updated_set is not None:
-      if url not in updated_set:
+    elif fetched_set is not None:
+      if url not in fetched_set:
         print "Updating %s" % url
         cc(['git', 'fetch'], cwd=repo_dir)
-        updated_set.add(url)
+        fetched_set.add(url)
 
     try:
       return co(['git', 'rev-parse', '--verify', 'origin/' + ref],
@@ -649,11 +649,11 @@ def main(argv):
     print_help()
 
   if cmd == 'update':
-    Builder(use_lockfile=False).setup_repos(update=True).save_lockfile().tag_repos()
+    Builder(use_lockfile=False).setup_repos(fetch=True).save_lockfile().tag_repos()
   elif cmd == 'just_rewrite':
-    Builder(use_lockfile=False).setup_repos(update=False).save_lockfile().tag_repos()
+    Builder(use_lockfile=False).setup_repos(fetch=False).save_lockfile().tag_repos()
   elif cmd == 'fetch':
-    Builder(use_lockfile=True).setup_repos(update=False).tag_repos()
+    Builder(use_lockfile=True).setup_repos(fetch=False).tag_repos()
   elif cmd == 'build':
     Builder(use_lockfile=True).run('go', 'install', './...', EMPTY_DEP)
   elif cmd == 'go':
