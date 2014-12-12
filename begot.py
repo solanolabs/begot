@@ -305,8 +305,8 @@ class Begotten(object):
   def deps(self):
     if 'deps' not in self.raw:
       raise BegottenFileError("Missing 'deps' section")
-    for name, val in self.raw['deps'].iteritems():
-      yield self.parse_dep(name, val)
+    return [self.parse_dep(name, val)
+        for name, val in self.raw['deps'].iteritems()]
 
   def set_deps(self, deps):
     def without_name(dep):
@@ -327,13 +327,10 @@ class Builder(object):
     else:
       fn = join(self.code_root, BEGOTTEN)
     self.bg = Begotten(fn)
-    self.deps = list(self.bg.deps())
+    self.deps = self.bg.deps()
 
   def _all_repos(self):
-    repos = {}
-    for dep in self.deps:
-      repos[dep.git_url] = dep.ref
-    return repos
+    return dict((dep.git_url, dep.ref) for dep in self.deps)
 
   def setup_repos(self, fetch):
     # Should only be called when loaded from Begotten, not lockfile.
