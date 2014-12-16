@@ -215,6 +215,7 @@ FILE_VERSION = 1
 KNOWN_GIT_SERVERS = {
   'github.com': 2,
   'bitbucket.org': 2,
+  'begot.test': 2,
 }
 
 cc = subprocess.check_call
@@ -270,6 +271,10 @@ class Begotten(object):
     yaml.dump(self.raw, open(fn, 'w'), default_flow_style=False)
 
   def default_git_url_from_repo_path(self, repo_path):
+    # Hook for testing:
+    if repo_path.startswith('begot.test/') and os.getenv('BEGOT_TEST_REPOS'):
+      return 'file://' + join(os.getenv('BEGOT_TEST_REPOS'), repo_path)
+    # Default to https for other repos:
     return 'https://' + repo_path
 
   def get_repo_alias(self, repo_path):
@@ -321,8 +326,10 @@ class Begotten(object):
   def deps(self):
     if 'deps' not in self.raw:
       raise BegottenFileError("Missing 'deps' section")
-    return [self.parse_dep(name, val)
-        for name, val in self.raw['deps'].iteritems()]
+    deps = self.raw['deps']
+    if not isinstance(deps, dict):
+      raise BegottenFileError("'deps' is not a dict")
+    return [self.parse_dep(name, val) for name, val in deps.iteritems()]
 
   def set_deps(self, deps):
     def without_name(dep):
