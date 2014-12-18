@@ -1,4 +1,6 @@
 #!/usr/bin/env python2
+#
+# Copyright (c) 2014 Solano Labs Inc.  All Rights Reserved.
 
 import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, fnmatch, yaml
 import tempfile, unittest, traceback, contextlib
