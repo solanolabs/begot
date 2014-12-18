@@ -30,17 +30,29 @@ def begot(*args):
   for line in out.splitlines():
     print ' ', line
 
-def begot_err(*args):
-  retval = subprocess.call((BEGOT,) + args)
+def begot_err(*args, **kwargs):
+  p = subprocess.Popen((BEGOT,) + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+  out, _ = p.communicate()
+  for line in out.splitlines():
+    print ' ', line
+  retval = p.wait()
   if retval == 0:
     raise subprocess.CalledProcessError(
         "begot didn't exit with an error as expected")
+
+  expect = kwargs.get('expect')
+  if isinstance(expect, str):
+    assert expect in out
+  elif hasattr(expect, 'search'):
+    assert expect.search(out)
+
 
 def git(*args):
   print '+', 'git', ' '.join(args)
   out = co(('git',) + args)
   for line in out.splitlines():
     print ' ', line
+  return out
 
 def write_begotten(deps):
   data = {'deps': deps}
@@ -51,8 +63,11 @@ def write_files(files):
     mkdir_p(os.path.dirname(name))
     open(name, 'w').write(contents)
 
+def repo_path(path):
+  return join(repodir, 'begot.test', path)
+
 def make_nonbegot_repo(path, files):
-  path = join(repodir, 'begot.test', path)
+  path = repo_path(path)
   mkdir_p(path)
   with chdir(path):
     git('init', '-q')
@@ -61,7 +76,7 @@ def make_nonbegot_repo(path, files):
     git('commit', '-q', '-m', 'initial commit')
 
 def make_begot_repo(path, deps, files):
-  path = join(repodir, 'begot.test', path)
+  path = repo_path(path)
   mkdir_p(path)
   with chdir(path):
     git('init', '-q')
@@ -204,7 +219,26 @@ def test_one_dep_with_subpath():
   deps = read_lockfile_deps(1)
   dep = deps.pop('tp/dep')
   assert dep['git_url'].endswith('user/repo')
-  assert dep.get('subpath') == 'pkg'
+  assert dep['subpath'] == 'pkg'
+
+  clear_cache_fetch_twice_and_build()
+
+
+def test_dep_as_git_url_and_subpath():
+  make_nonbegot_repo('user/repo',
+      {'pkg/code.go': NUMBER_GO})
+
+  url = 'file://' + repo_path('user/repo')
+  make_begot_workdir(
+      {'tp/dep': {'git_url': url, 'subpath': 'pkg'}},
+      {'app/main.go': MAIN_GO})
+
+  begot('update')
+
+  deps = read_lockfile_deps(1)
+  dep = deps.pop('tp/dep')
+  assert dep['git_url'].endswith('user/repo')
+  assert dep['subpath'] == 'pkg'
 
   clear_cache_fetch_twice_and_build()
 
@@ -226,11 +260,11 @@ def test_one_dep_with_implicit_dep_in_same_repo():
 
   dep = deps.pop('tp/dep')
   assert dep['git_url'].endswith('user/repo')
-  assert dep.get('subpath') == 'pkg'
+  assert dep['subpath'] == 'pkg'
 
   _, otherdep = deps.popitem()
   assert otherdep['git_url'] == dep['git_url']
-  assert otherdep.get('subpath') == 'otherpkg'
+  assert otherdep['subpath'] == 'otherpkg'
 
   clear_cache_fetch_twice_and_build()
 
@@ -299,7 +333,7 @@ def test_begot_dep_with_subpath():
   deps = read_lockfile_deps(1)
   dep = deps.pop('tp/dep')
   assert dep['git_url'].endswith('user/repo')
-  assert dep.get('subpath') == 'pkg'
+  assert dep['subpath'] == 'pkg'
 
   clear_cache_fetch_twice_and_build()
 
@@ -322,10 +356,10 @@ def test_begot_dep_with_begot_dep_different_name(): # both have subpaths
   deps = read_lockfile_deps(2)
   dep = deps.pop('tp/dep')
   assert dep['git_url'].endswith('user/repo')
-  assert dep.get('subpath') == 'pkg'
+  assert dep['subpath'] == 'pkg'
   _, otherdep = deps.popitem()
   assert otherdep['git_url'].endswith('user/otherrepo')
-  assert otherdep.get('subpath') == 'pkg2'
+  assert otherdep['subpath'] == 'pkg2'
 
   clear_cache_fetch_twice_and_build()
 
@@ -353,10 +387,10 @@ def test_begot_dep_with_begot_dep_same_name():
   assert all('tp/dep' in name for name in deps.keys())
   dep = deps.pop('tp/dep')
   assert dep['git_url'].endswith('user/repo')
-  assert dep.get('subpath') == 'pkg'
+  assert dep['subpath'] == 'pkg'
   _, otherdep = deps.popitem()
   assert otherdep['git_url'].endswith('user/otherrepo')
-  assert otherdep.get('subpath') == 'pkg2'
+  assert otherdep['subpath'] == 'pkg2'
 
   clear_cache_fetch_twice_and_build()
 
@@ -579,35 +613,161 @@ def test_two_begot_deps_with_deps_with_same_name():
   clear_cache_fetch_twice_and_build()
 
 
-#   conflict between two deps in same project
-#   FIXME
+def test_conflict_between_two_deps():
+  make_nonbegot_repo('user/repo', {'code.go': NUMBER_GO})
 
-#   conflict between dep and dep of begot dep
-#   FIXME
+  with chdir(repo_path('user/repo')):
+    git('tag', 'one')
+    open('code.go', 'a').write('\n//comment\n')
+    git('commit', '-q', '-a', '-m', 'comment')
+    git('tag', 'two')
 
-#   conflict between two deps of begot dep
-#   FIXME
+  make_begot_workdir(
+      {'tp/dep1': {'import_path': 'begot.test/user/repo', 'ref': 'one'},
+       'tp/dep2': {'import_path': 'begot.test/user/repo', 'ref': 'two'}},
+      {})
 
-#   dep as simple string
-#   FIXME
+  begot_err('update', expect="Conflicting versions")
 
-#   dep as import_path
-#   FIXME
 
-#   dep as git_url and subpath
-#   FIXME
+def test_conflict_between_dep_and_dep_of_dep():
+  make_nonbegot_repo('otheruser/repo',
+      {'code.go': NUMBER_GO})
 
-#   redirection with repo aliases
-#   FIXME
+  with chdir(repo_path('otheruser/repo')):
+    git('tag', 'one')
+    open('code.go', 'a').write('\n//comment\n')
+    git('commit', '-q', '-a', '-m', 'comment')
+    git('tag', 'two')
 
-#   explicit ref with branch
-#   FIXME
+  make_begot_repo('user/repo',
+      {'tp/otherdep': {'import_path': 'begot.test/otheruser/repo', 'ref': 'two'}},
+      {})
 
-#   explicit ref with tag
-#   FIXME
+  make_begot_workdir(
+      {'tp/dep': {'import_path': 'begot.test/user/repo'},
+       'tp/otherdep': {'import_path': 'begot.test/otheruser/repo', 'ref': 'one'}},
+      {'app/main.go': MAIN_GO})
 
-#   explicit ref with commit id
-#   FIXME
+  begot_err('update', expect="Conflict:")
+
+
+def test_nonconflict_between_dep_with_ref_and_implicit_dep():
+  make_nonbegot_repo('otheruser/repo',
+      {'code.go': NUMBER_GO})
+
+  with chdir(repo_path('otheruser/repo')):
+    git('tag', 'one')
+    open('code.go', 'a').write('\n//comment\n')
+    git('commit', '-q', '-a', '-m', 'comment')
+    # 'master' is now different than 'one'
+    one = git('rev-parse', 'one').strip()
+    master = git('rev-parse', 'master').strip()
+    assert one != master
+
+  make_nonbegot_repo('user/repo',
+      {'code.go': DEP_IN_OTHER_REPO_GO})
+
+  make_begot_workdir(
+      {'tp/dep': {'import_path': 'begot.test/user/repo'},
+       'tp/otherdep': {'import_path': 'begot.test/otheruser/repo', 'ref': 'one'}},
+      {'app/main.go': MAIN2_GO})
+
+  begot('update')
+
+  deps = read_lockfile_deps(2)
+  otherdep = deps.pop('tp/otherdep')
+  assert otherdep['git_url'].endswith('otheruser/repo')
+  assert otherdep['ref'] == one
+
+  clear_cache_fetch_twice_and_build()
+
+
+def test_dep_with_branch():
+  make_nonbegot_repo('user/repo',
+      {'pkg/code.go': NUMBER_GO})
+
+  with chdir(repo_path('user/repo')):
+    git('checkout', '-b', 'branch')
+    open('pkg/code.go', 'a').write('\n//comment\n')
+    git('commit', '-q', '-a', '-m', 'comment')
+    branch = git('rev-parse', 'branch').strip()
+
+  make_begot_workdir(
+      {'tp/dep': {'import_path': 'begot.test/user/repo/pkg', 'ref': 'branch'}},
+      {'app/main.go': MAIN_GO})
+
+  begot('update')
+
+  deps = read_lockfile_deps(1)
+  dep = deps.pop('tp/dep')
+  assert dep['ref'] == branch
+
+  clear_cache_fetch_twice_and_build()
+
+
+def test_dep_with_commit_id():
+  make_nonbegot_repo('user/repo',
+      {'pkg/code.go': NUMBER_GO})
+
+  with chdir(repo_path('user/repo')):
+    ref = git('rev-parse', 'master').strip()
+    open('pkg/code.go', 'a').write('\n//comment\n')
+    git('commit', '-q', '-a', '-m', 'comment')
+    assert ref != git('rev-parse', 'master').strip()
+
+  make_begot_workdir(
+      {'tp/dep': {'import_path': 'begot.test/user/repo/pkg', 'ref': ref}},
+      {'app/main.go': MAIN_GO})
+
+  begot('update')
+
+  deps = read_lockfile_deps(1)
+  dep = deps.pop('tp/dep')
+  assert dep['ref'] == ref
+
+  clear_cache_fetch_twice_and_build()
+
+
+def test_repo_alias_simple():
+  make_nonbegot_repo('otheruser/repo',
+      {'code.go': NUMBER_GO})
+
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo'},
+      {'app/main.go': MAIN_GO})
+
+  aliases = {'repo_aliases': {'begot.test/user/repo': 'begot.test/otheruser/repo'}}
+  yaml.safe_dump(aliases, open('Begotten', 'a'))
+
+  begot('update')
+
+  deps = read_lockfile_deps(1)
+  assert all(dep['git_url'].endswith('otheruser/repo') for dep in deps.values())
+
+  clear_cache_fetch_twice_and_build()
+
+
+def test_repo_alias_with_implicit_dep_on_self():
+  make_nonbegot_repo('otheruser/repo',
+      # imports begot.test/user/repo/otherpkg, but gets redirected to self.
+      {'pkg/code.go': DEP_IN_SAME_REPO_GO,
+       'otherpkg/code.go': NUMBER_GO})
+
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo/pkg'},
+      {'app/main.go': MAIN2_GO})
+
+  aliases = {'repo_aliases': {'begot.test/user/repo': 'begot.test/otheruser/repo'}}
+  yaml.safe_dump(aliases, open('Begotten', 'a'))
+
+  begot('update')
+
+  deps = read_lockfile_deps(2)
+  assert all(dep['git_url'].endswith('otheruser/repo') for dep in deps.values())
+
+  clear_cache_fetch_twice_and_build()
+
 
 #   limited update of one dep
 #   FIXME
