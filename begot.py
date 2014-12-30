@@ -483,7 +483,12 @@ class Builder(object):
     repo_dir = self._repo_dir(url)
 
     print "Fixing imports in %s" % url
-    cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
+    try:
+      cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
+    except subprocess.CalledProcessError:
+      print "Missing local ref %r, updating" % resolved_ref
+      cc(['git', 'fetch', '-q'], cwd=repo_dir)
+      cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
 
     # Match up sub-deps to our deps.
     sub_dep_map = {}
