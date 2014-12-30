@@ -609,7 +609,7 @@ class Builder(object):
       self._reset_to_tags()
     except subprocess.CalledProcessError:
       print >>sys.stderr, ("Begotten.lock refers to a missing local commit. "
-          "Run 'begot fetch' first.")
+          "Please run 'begot fetch' first.")
       sys.exit(1)
 
     # Set up code_wk.
@@ -670,7 +670,12 @@ class Builder(object):
 
   def _reset_to_tags(self):
     for url, ref in self._all_repos().iteritems():
-      cc(['git', 'reset', '-q', '--hard', 'tags/' + self._tag_hash(ref)], cwd=self._repo_dir(url))
+      wd = self._repo_dir(url)
+      if not os.path.isdir(wd):
+        print >>sys.stderr, ("Begotten.lock refers to a missing local commit. "
+            "Please run 'begot fetch' first.")
+        sys.exit(1)
+      cc(['git', 'reset', '-q', '--hard', 'tags/' + self._tag_hash(ref)], cwd=wd)
 
   def _setup_dep(self, dep):
     path = join(self.dep_wk, 'src', dep.name)
