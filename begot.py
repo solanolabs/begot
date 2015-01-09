@@ -199,7 +199,8 @@ Subcommands:
 
 """
 
-import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, fnmatch, yaml
+import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, fnmatch, glob
+import yaml
 
 BEGOTTEN = 'Begotten'
 BEGOTTEN_LOCK = 'Begotten.lock'
@@ -247,6 +248,7 @@ def _ln_sf(target, path):
     _rm(path)
     _mkdir_p(os.path.dirname(path))
     os.symlink(target, path)
+    return True
 
 
 class Dep(dict):
@@ -634,7 +636,15 @@ class Builder(object):
     old_deps.discard('')
 
     for dep in self.deps:
-      path = self._setup_dep(dep)
+      path = join(self.dep_wk, 'src', dep.name)
+      target = join(self._repo_dir(dep.git_url), dep.subpath)
+      if _ln_sf(target, path):
+        # If we've created or changed this symlink, any pkg files that go may
+        # have compiled from it should be invalidated.
+        # Note: This makes some assumptions about go's build layout. It should
+        # be safe enough, though it may be simpler to just blow away everything
+        # if any dep symlinks change.
+        _rm(*glob.glob(join(self.dep_wk, 'pkg', '*', dep.name + '.*')))
       old_deps.discard(path)
 
     # Remove unexpected deps.
@@ -681,12 +691,6 @@ class Builder(object):
             "Please run 'begot fetch' first.")
         sys.exit(1)
       cc(['git', 'reset', '-q', '--hard', 'tags/' + self._tag_hash(ref)], cwd=wd)
-
-  def _setup_dep(self, dep):
-    path = join(self.dep_wk, 'src', dep.name)
-    target = join(self._repo_dir(dep.git_url), dep.subpath)
-    _ln_sf(target, path)
-    return path
 
   def clean(self):
     shutil.rmtree(self.dep_wk, ignore_errors=True)

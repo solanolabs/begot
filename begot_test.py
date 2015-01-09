@@ -794,6 +794,11 @@ def test_repo_alias_with_implicit_dep_on_self():
 #   change in dep causes rebuilding
 #   FIXME
 
+#   build with a dep at one revision, then build with the same dep name
+#   referring to another repo. ensure that begot cleans up the pkg files
+#   so that the necessary things get rebuilt.
+#   FIXME
+
 
 # clean
 #   FIXME
