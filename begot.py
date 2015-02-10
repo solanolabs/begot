@@ -598,7 +598,9 @@ class Builder(object):
   def tag_repos(self):
     # Run this after setup_repos.
     for url, ref in self._all_repos().iteritems():
-      cc(['git', 'tag', '--force', self._tag_hash(ref)], cwd=self._repo_dir(url))
+      out = co(['git', 'tag', '--force', self._tag_hash(ref)], cwd=self._repo_dir(url))
+      for line in out.splitlines():
+        if not line.startswith('Updated tag '): print line
 
   def _tag_hash(self, ref, cached_lf_hash=[]):
     # We want to tag the current state with a name that depends on:
