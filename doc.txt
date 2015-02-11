@@ -1,0 +1,192 @@
+Begot is a different approach to managing Go dependencies.
+
+There are lots of desirable features in the Go dependency design space:
+
+  - reproducible builds
+  - source-based distribution
+  - no reliance on central repository
+  - self-contained builds (no reliance on any third party)
+  - versioned import paths
+  - dependent code should not be rewritten
+  - works with workspaces within git repos
+  - works with git repos within workspaces
+  - works with git repos not within workspaces
+  - works with private repos
+  - compatibility with go build/install
+  - able to use go-gettable dependencies
+  - produces go-gettable dependencies
+  - no extraneous metadata file
+  - relocatable repos without rewriting imports
+  - manages dependent scm repos for you
+
+It is impossible to satisfy all of these at once. That's why there are so many
+existing options in this space. Furthermore, people place different priorities
+on these features and prefer different subsets along the satisfiable frontier.
+That's why people can't agree on one option.
+
+Begot is a point in the space that works for us. It may not work for everyone.
+
+---
+
+The Go creators tried to eliminate the need for dependency metadata by encoding
+all the needed metadata into the import path. Unfortunately, they decided to
+encode just enough metadata to be dangerous (i.e. one place where the code could
+be fetched from), but not enough to be complete. The import path lacks:
+
+  - any sort of version identifier
+  - a content hash to ensure reproducibility
+  - a protocol to be used for fetching (for private repos)
+  - alternative locations to fetch the code from if the canonical source is
+    unavailable
+  - directions to use a custom fork rather than the canonical source
+
+Most Go depdency tools try to preserve some of the existing properties of import
+paths, which leads to a confusing model and other problems (TODO: elaborate
+here). We'd rather throw them out completely. When using begot, you use
+user-chosen import paths that name the package but don't contain any information
+about where to obtain the actual code. That's in an external metadata file.
+Additionally, relative imports within the repo use import paths relative to the
+repo root (as if the repo was directly within "src" in a go workspace), instead
+of including a canonical path to the repo with every import. Thus, we
+immediately see the following advantages and disadvantages:
+
+  Pros:
+  - builds are completely reproducible
+  - supporting private repos is trivial
+  - you can switch to a custom fork of a dependency with a metadata change
+  - no danger of multiple copies of a dependency (as long as no one in the
+    dependency tree vendors things with paths rewritten to be within their repo)
+  - repos are trivially relocatable without rewriting imports
+  - you can use relative dependencies without setting up an explicit workspace
+
+  Cons:
+  - repos are not go-gettable
+  - a wrapper around the go tool is required
+
+Begot also adds some amount of transparent scm repo management, since we do need
+to rewrite import paths, and if we're rewriting code, we should use an scm
+system to track those changes.
+
+---
+
+Currently, the fear that a particular dependency or version of a dependency will
+become unavailable and a build no longer reproducible leads to the practice of
+vendoring dependencies within a project repo. Instead of combining multiple
+logical repos into one (and discarding history and metadata), our approach is to
+combine begot with another tool that manages mirrors of third-party dependencies
+in scm hosting that you control, e.g. forks within your own github organization.
+(This other tool doesn't exist yet.)
+
+---
+
+Usage:
+
+Somewhere within your repo, put some .go files or packages in a directory with a
+file named Begotten. That code will end up within a 'src' directory in a
+temporary workspace created by begot, along with your dependencies.
+
+A Begotten file is in yaml format and looks roughly like this:
+
+  deps:
+    third_party/systemstat: bitbucket.org/bertimus9/systemstat
+    third_party/gorilla/mux: github.com/gorilla/mux
+    third_party/docker:
+      import_path: github.com/fsouza/go-dockerclient
+      ref: 0.2.1
+    third_party/goamz/s3: github.com/mitchellh/goamz/s3
+    tddium/util: github.com/solanolabs/tddium_go/util
+    tddium/client:
+      git_url: git@github.com:solanolabs/tddium_go
+      subpath: client
+  repo_aliases:
+    github.com/solanolabs/tddium_go:
+      git_url: git@github.com:solanolabs/tddium_go
+      #ref: some_branch
+    github.com/mitchellh/goamz: github.com/wkj/goamz
+
+Notes:
+- A plain string is shorthand for {"import_path": ...}
+- You can override the git url used, in a single place, which will apply to the
+  whole project and all of its dependencies.
+- You can refer to a branch, tag, or commit hash, using the 'ref' option (which
+  defaults to 'master').
+- You can redirect all packages in a whole repo to another repo, and optionally
+  pin it to a given ref.
+- Using ssh-style git urls allows using private repos easily.
+
+In your code, you can then refer to these deps with the import path
+"third_party/docker", "third_party/gorilla/mux", etc. and begot will set up the
+temporary workspace correctly.
+
+Subcommands:
+
+  begot update:
+    1. Reads Begotten
+    2. Fetches (and updates) transitive dependencies
+    3. (Re-)resolves references
+    4. Rewrites imports in dependencies
+    5. writes locked references to Begotten.lock
+
+    Use this when:
+    - You've just written a new Begotten file.
+    - You want to bump the version of all dependencies (when you've requested
+      'master' or another branch).
+
+  begot just_rewrite:
+    Does what 'begot update' does except does not fetch new code if the
+    dependency is already present in the cache.
+
+    In general, you shouldn't need to use this. Prefer 'begot update' or 'begot
+    fetch', as appropriate. This is useful if something has changed about the
+    way begot rewrites dependencies and you want to fix it without bumping
+    versions.
+
+  begot fetch:
+    1. Reads Begotten.lock
+    2. Fetches transitive dependencies
+    3. Rewrites imports in dependencies
+
+    Use this when:
+    - You've just cloned or updated your code repo and you want to get the
+      dependencies required for building.
+
+  begot build/go/exec:
+    1. Reads Begotten.lock
+    2. Ensures the dependency repos are at the correct revisions and have
+       correctly-rewritten imports
+    3. Sets up a symlink from 'bin' in the current directory to 'bin' in the
+       first go workspace in GOPATH, i.e., the place where 'go install' will put
+       binaries.
+    4. Runs the given command in a go workspace with the dependencies specified
+       in Begotten.lock. 'begot go' is a shorthand for 'begot exec go', and
+       'begot build' is a shorthand for 'begot go install ./...'. In short:
+         begot build         runs   go install ./...   [*]
+         begot go <args>     runs   go <args>
+         begot exec <args>   runs   <args>
+
+    Use this when:
+    - You want to build your project.
+
+    [*]: This is actually slightly more complicated. See comments in Builder.run
+
+  begot clean:
+    1. Removes the temprary workspaces, including built binaries.
+
+  begot gopath:
+    1. Prints the GOPATH that would be used for 'begot build' (except skipping
+       most of the work).
+
+    Use this from shell or editor hooks.
+
+    Here's some sample vim script:
+
+      function! SetBegotGoPath()
+        let gopath = substitute(system("begot gopath"), "\n", "", "")
+        if v:shell_error == 0
+          let $GOPATH = gopath
+        endif
+      endfunction
+      call SetBegotGoPath()
+
+  begot help:
+    1. Prints this text.

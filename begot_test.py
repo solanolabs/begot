@@ -9,7 +9,7 @@ cc = subprocess.check_call
 co = subprocess.check_output
 join = os.path.join
 
-BEGOT = os.path.realpath(join(os.path.dirname(__file__), 'begot.py'))
+BEGOT = os.path.realpath(join(os.path.dirname(__file__), 'begot'))
 
 
 @contextlib.contextmanager

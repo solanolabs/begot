@@ -1,4 +1,7 @@
 test_pattern: none
+hooks:
+  pre:
+    make
 tests:
 - env SHARD=0/5 ./begot_test.py
 - env SHARD=1/5 ./begot_test.py

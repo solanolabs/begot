@@ -2,13 +2,8 @@
 
 [![](https://ci.solanolabs.com:443/solanolabs/begot/badges/155480.png)](https://ci.solanolabs.com:443/solanolabs/begot/suites/155480)
 
-Begot is a Go dependency manager and build tool. Please read the docstring at
-the top of begot.py for a discussion of motivation, design decisions, and
-documentation.
-
-Begot is currently written in Python (2.x), though it may be rewritten in Go at
-some point in the future. It requires the PyYAML library (`python-yaml` in
-Ubuntu or Fedora or `pip install pyyaml`).
+Begot is a Go dependency manager and build tool. Please read doc.txt for a
+discussion of motivation, design decisions, and usage instructions.
 
 Begot is released under a simplified BSD license.
 
@@ -16,7 +11,7 @@ Begot is released under a simplified BSD license.
 
 Prerequisites:
 
-- Clone this repo and `ln -s path/to/begot.py ~/bin/begot`.
+- Clone this repo and `cd begot && make && install ./begot ~/bin/begot`.
 
 Converting an existing project:
 
@@ -35,4 +30,4 @@ Building a project using begot:
 - Run `begot fetch`.
 - Run `begot build`.
 
-See the documentation in `begot.py` or run `begot help` for more details.
+See the documentation in `doc.txt` or run `begot help` for more details.
