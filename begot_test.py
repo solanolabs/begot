@@ -31,6 +31,7 @@ def begot(*args):
   out = co((BEGOT,) + args)
   for line in out.splitlines():
     print ' ', line
+  return out
 
 def begot_err(*args, **kwargs):
   p = subprocess.Popen((BEGOT,) + args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -155,7 +156,7 @@ MAIN_GO = stripiws(r"""
   import "fmt"
   import "tp/dep"
   func main() {
-    fmt.Printf("The answer is %s.", number.NUMBER)
+    fmt.Printf("The answer is %d.", number.NUMBER)
   }
 """)
 
@@ -164,7 +165,7 @@ MAIN2_GO = stripiws(r"""
   import "fmt"
   import "tp/dep"
   func main() {
-    fmt.Printf("The answer is %s.", number2.NUMBER2)
+    fmt.Printf("The answer is %d.", number2.NUMBER2)
   }
 """)
 
@@ -174,7 +175,7 @@ MAIN3_GO = stripiws(r"""
   import "tp/dep"
   import "tp/otherdep"
   func main() {
-    fmt.Printf("The answer is %s.", number2.NUMBER2 + number3.NUMBER3)
+    fmt.Printf("The answer is %d.", number2.NUMBER2 + number3.NUMBER3)
   }
 """)
 
@@ -771,40 +772,312 @@ def test_repo_alias_with_implicit_dep_on_self():
   clear_cache_fetch_twice_and_build()
 
 
-#   limited update of one dep
-#   FIXME
+def test_full_update():
+  make_nonbegot_repo('user/repo1', {'a': 'a'})
+  make_nonbegot_repo('user/repo2', {'a': 'a'})
 
-#   limited update of dep with implicit dep
-#   FIXME
+  make_begot_workdir(
+      {'tp/dep1': 'begot.test/user/repo1',
+       'tp/dep2': 'begot.test/user/repo2'},
+      {})
 
-# build:
+  begot('update')
 
-#   build two projects that depend on a repo at different revs
-#   FIXME
+  before = read_lockfile_deps(2)
+  oneb = before['tp/dep1']['ref']
+  twob = before['tp/dep2']['ref']
 
-#   build before fetch and get error
-#   FIXME
+  for repo in 'user/repo1', 'user/repo2':
+    with chdir(repo_path(repo)):
+      open('b', 'w').write('b')
+      git('add', '.')
+      git('commit', '-q', '-m', 'b')
 
-#   change in project causes rebuilding
-#   FIXME
+  begot('update')
 
-#   change in self-package causes rebuilding
-#   FIXME
+  after = read_lockfile_deps(2)
+  onea = after['tp/dep1']['ref']
+  twoa = after['tp/dep2']['ref']
 
-#   change in dep causes rebuilding
-#   FIXME
-
-#   build with a dep at one revision, then build with the same dep name
-#   referring to another repo. ensure that begot cleans up the pkg files
-#   so that the necessary things get rebuilt.
-#   FIXME
+  assert oneb != onea
+  assert twob != twoa
 
 
-# clean
-#   FIXME
+def test_limited_update():
+  make_nonbegot_repo('user/repo1', {'a': 'a'})
+  make_nonbegot_repo('user/repo2', {'a': 'a'})
 
-# gopath
-#   FIXME
+  make_begot_workdir(
+      {'tp/dep1': 'begot.test/user/repo1',
+       'tp/dep2': 'begot.test/user/repo2',
+       'tp/dep3': 'begot.test/user/repo2/subdir'},
+      {})
+
+  begot('update')
+
+  before = read_lockfile_deps(3)
+  oneb = before['tp/dep1']['ref']
+  twob = before['tp/dep2']['ref']
+  threeb = before['tp/dep3']['ref']
+
+  for repo in 'user/repo1', 'user/repo2':
+    with chdir(repo_path(repo)):
+      open('b', 'w').write('b')
+      git('add', '.')
+      git('commit', '-q', '-m', 'b')
+
+  begot('update', 'tp/dep2')
+
+  after = read_lockfile_deps(3)
+  onea = after['tp/dep1']['ref']
+  twoa = after['tp/dep2']['ref']
+  threea = after['tp/dep3']['ref']
+
+  assert oneb == onea
+  assert twob != twoa
+  assert threeb != threea # updated because dep2 was updated
+
+
+def test_limited_update_with_implicit_dep():
+  make_nonbegot_repo('otheruser/repo', {'a': 'a'})
+  make_nonbegot_repo('user/repo1', {
+    'code.go': DEP_IN_OTHER_REPO_GO,
+    })
+  make_nonbegot_repo('user/repo2', {'a': 'a'})
+
+  make_begot_workdir(
+      {'tp/dep1': 'begot.test/user/repo1',
+       'tp/dep2': 'begot.test/user/repo2'},
+      {})
+
+  begot('update')
+
+  before = read_lockfile_deps(3)
+  oneb = before.pop('tp/dep1')['ref']
+  twob = before.pop('tp/dep2')['ref']
+  otherb = before.popitem()[1]['ref']
+
+  for repo in 'user/repo1', 'user/repo2', 'otheruser/repo':
+    with chdir(repo_path(repo)):
+      open('b', 'w').write('b')
+      git('add', '.')
+      git('commit', '-q', '-m', 'b')
+
+  begot('update', 'tp/dep1')
+
+  after = read_lockfile_deps(3)
+  onea = after.pop('tp/dep1')['ref']
+  twoa = after.pop('tp/dep2')['ref']
+  othera = after.popitem()[1]['ref']
+
+  assert oneb != onea
+  assert twob == twoa
+  assert otherb != othera # updated because dep1 was updated
+
+
+def test_limited_update_with_explicit_dep():
+  make_nonbegot_repo('otheruser/repo', {'a': 'a'})
+  make_begot_repo('user/repo1',
+      {'otherdep': 'begot.test/otheruser/repo'},
+      {'a': 'a'})
+  make_nonbegot_repo('user/repo2', {'a': 'a'})
+
+  make_begot_workdir(
+      {'tp/dep1': 'begot.test/user/repo1',
+       'tp/dep2': 'begot.test/user/repo2'},
+      {})
+
+  begot('update')
+
+  before = read_lockfile_deps(3)
+  oneb = before.pop('tp/dep1')['ref']
+  twob = before.pop('tp/dep2')['ref']
+  otherb = before.popitem()[1]['ref']
+
+  for repo in 'otheruser/repo', 'user/repo1', 'user/repo2':
+    with chdir(repo_path(repo)):
+      open('b', 'w').write('b')
+      if os.path.exists('Begotten'):
+        begot('update')
+      git('add', '.')
+      git('commit', '-q', '-m', 'b')
+
+  begot('update', 'tp/dep1')
+
+  after = read_lockfile_deps(3)
+  onea = after.pop('tp/dep1')['ref']
+  twoa = after.pop('tp/dep2')['ref']
+  othera = after.popitem()[1]['ref']
+
+  assert oneb != onea
+  assert twob == twoa
+  assert otherb != othera # updated because dep1 was updated
+
+
+def test_fetch_before_build():
+  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo'},
+      {'app/main.go': MAIN_GO})
+
+  begot('update')
+  clear_cache()
+  begot_err('build', expect='missing local commit')
+
+
+def test_no_rebuild():
+  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo'},
+      {'app/main.go': MAIN_GO})
+
+  begot('update')
+  begot('build')
+  timeb = os.stat('bin/app').st_mtime
+
+  begot('build')
+  timea = os.stat('bin/app').st_mtime
+
+  assert timeb == timea
+
+
+def test_rebuild_on_local_change():
+  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo'},
+      {'app/main.go': MAIN_GO})
+
+  begot('update')
+  begot('build')
+  timeb = os.stat('bin/app').st_mtime
+
+  open('app/main.go', 'a').write("\n")
+  begot('build')
+  timea = os.stat('bin/app').st_mtime
+
+  assert timeb != timea
+
+
+def test_rebuild_on_dep_change():
+  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo'},
+      {'app/main.go': MAIN_GO})
+
+  begot('update')
+  begot('build')
+  timeb = os.stat('bin/app').st_mtime
+
+  with chdir(repo_path('user/repo')):
+    open('number.go', 'a').write("\n")
+    git('commit', '-q', '-a', '-m', 'foo')
+
+  begot('update')
+  begot('build')
+  timea = os.stat('bin/app').st_mtime
+
+  assert timeb != timea
+
+
+def test_rebuild_on_self_dep_change():
+  make_begot_workdir(
+      {},
+      {
+        'app/main.go': MAIN_GO,
+        'tp/dep/code.go': NUMBER_GO,
+      })
+
+  begot('update')
+  begot('build')
+  timeb = os.stat('bin/app').st_mtime
+
+  open('tp/dep/code.go', 'a').write("\n")
+
+  begot('update')
+  begot('build')
+  timea = os.stat('bin/app').st_mtime
+
+  assert timeb != timea
+
+
+def test_build_consistency():
+  make_nonbegot_repo('user/repo',
+      {'number.go': "package number\nconst NUMBER = 42\n"})
+
+  t1, t2 = repo_path('t1'), repo_path('t2')
+
+  for t in t1, t2:
+    mkdir_p(t)
+    with chdir(t):
+      make_begot_workdir(
+          {'tp/dep': 'begot.test/user/repo'},
+          {'app/main.go': MAIN_GO})
+      begot('update')
+
+    with chdir(repo_path('user/repo')):
+      open('number.go', 'w').write("package number\nconst NUMBER = 44\n")
+      git('commit', '-q', '-a', '--allow-empty', '-m', 'foo')
+
+  for t, ans in zip([t1, t2, t1, t2], [42, 44, 42, 44]):
+    with chdir(t):
+      begot('clean')
+      begot('build')
+      assert co('./bin/app') == ('The answer is %d.' % ans)
+
+
+def test_build_consistency_across_repo_rename():
+  """This situation is a little tricky, but can come up when switching between
+  git branches in the same repo when different branches use the same dep name to
+  refer to two different origin repos. The key is that Begotten.lock changes
+  (from one correct version to another) without running begot fetch (which would
+  reset and rewrite files and cause a rebuild that way). We use rename to
+  emulate switching branches. See commit 200400b.
+  """
+  make_nonbegot_repo('user/repo',
+      {'number.go': "package number\nconst NUMBER = 42\n"})
+  make_nonbegot_repo('user/repo2',
+      {'number.go': "package number\nconst NUMBER = 44\n"})
+
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo'},
+      {'app/main.go': MAIN_GO})
+  begot('update')
+
+  os.rename('Begotten', 'orig-Begotten')
+  os.rename('Begotten.lock', 'orig-Begotten.lock')
+
+  write_begotten({'tp/dep': 'begot.test/user/repo2'})
+  begot('update')
+
+  begot('build')
+  assert co('./bin/app') == 'The answer is 44.'
+
+  os.rename('orig-Begotten', 'Begotten')
+  os.rename('orig-Begotten.lock', 'Begotten.lock')
+
+  begot('build')
+  assert co('./bin/app') == 'The answer is 42.'
+
+
+def test_clean_and_gopath():
+  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo'},
+      {'app/main.go': MAIN_GO})
+
+  gopath = begot('gopath').strip()
+  begot('update')
+  begot('build')
+  linkdest = os.readlink('bin')
+  for elt in gopath.split(':'):
+    assert os.path.isdir(elt)
+
+  begot('clean')
+  assert not os.path.exists('bin')
+  assert not os.path.exists(linkdest)
+  for elt in gopath.split(':'):
+    assert not os.path.isdir(elt)
+
 
 # fetch/build with wrong file version number
 #   FIXME
