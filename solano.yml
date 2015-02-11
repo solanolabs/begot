@@ -1,6 +1,10 @@
 test_pattern: none
 tests:
-- ./begot_test.py
+- env SHARD=0/5 ./begot_test.py
+- env SHARD=1/5 ./begot_test.py
+- env SHARD=2/5 ./begot_test.py
+- env SHARD=3/5 ./begot_test.py
+- env SHARD=4/5 ./begot_test.py
 python:
   python_version: '2.7'
   pip_requirements_file: requirements.txt

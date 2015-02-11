@@ -1097,11 +1097,12 @@ def global_teardown():
   os.chdir('/')
   shutil.rmtree(tmpdir)
 
-def run_tests():
+def run_tests(shard=0, count=1):
   passed = failed = 0
-  for name, func in globals().iteritems():
+  for i, (name, func) in enumerate(sorted(globals().items())):
     if not callable(func): continue
     if not name.startswith('test'): continue
+    if (i % count) != shard: continue
 
     # clean up
     clear_cache()
@@ -1133,7 +1134,8 @@ def run_tests():
 def main():
   try:
     global_setup()
-    retval = run_tests()
+    shard, count = map(int, os.getenv('SHARD', '0/1').split('/'))
+    retval = run_tests(shard, count)
     sys.exit(retval)
   finally:
     global_teardown()
