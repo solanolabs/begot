@@ -1,5 +1,7 @@
 # begot
 
+[![](https://ci.solanolabs.com:443/solanolabs/begot/badges/155480.png)](https://ci.solanolabs.com:443/solanolabs/begot/suites/155480)
+
 Begot is a Go dependency manager and build tool. Please read the docstring at
 the top of begot.py for a discussion of motivation, design decisions, and
 documentation.
