@@ -3,7 +3,7 @@
 # Copyright (c) 2014 Solano Labs Inc.  All Rights Reserved.
 
 import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, fnmatch, yaml
-import tempfile, unittest, traceback, contextlib
+import tempfile, unittest, traceback, contextlib, time
 
 cc = subprocess.check_call
 co = subprocess.check_output
@@ -935,6 +935,7 @@ def test_no_rebuild():
   begot('build')
   timeb = os.stat('bin/app').st_mtime
 
+  time.sleep(1.5)
   begot('build')
   timea = os.stat('bin/app').st_mtime
 
@@ -951,6 +952,7 @@ def test_rebuild_on_local_change():
   begot('build')
   timeb = os.stat('bin/app').st_mtime
 
+  time.sleep(1.5)
   open('app/main.go', 'a').write("\n")
   begot('build')
   timea = os.stat('bin/app').st_mtime
@@ -968,6 +970,7 @@ def test_rebuild_on_dep_change():
   begot('build')
   timeb = os.stat('bin/app').st_mtime
 
+  time.sleep(1.5)
   with chdir(repo_path('user/repo')):
     open('number.go', 'a').write("\n")
     git('commit', '-q', '-a', '-m', 'foo')
@@ -991,6 +994,7 @@ def test_rebuild_on_self_dep_change():
   begot('build')
   timeb = os.stat('bin/app').st_mtime
 
+  time.sleep(1.5)
   open('tp/dep/code.go', 'a').write("\n")
 
   begot('update')
