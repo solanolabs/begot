@@ -53,6 +53,7 @@ func Command(cwd string, name string, args ...string) (cmd *exec.Cmd) {
 }
 
 func cc(cwd string, name string, args ...string) {
+	//fmt.Println("+", "in", filepath.Base(cwd), ":", name, args)
 	cmd := Command(cwd, name, args...)
 	if err := cmd.Run(); err != nil {
 		panic(err)
@@ -60,6 +61,7 @@ func cc(cwd string, name string, args ...string) {
 }
 
 func co(cwd string, name string, args ...string) string {
+	//fmt.Println("+", "in", filepath.Base(cwd), ":", name, args)
 	cmd := Command(cwd, name, args...)
 	if outb, err := cmd.Output(); err != nil {
 		panic(err)
@@ -184,12 +186,12 @@ func (bf *BegottenFile) parse_dep(name string, v interface{}) (dep Dep) {
 	dep.name = name
 
 	if _, ok := v.(string); ok {
-		v = yaml.MapSlice{yaml.MapItem{"import_path", v}}
+		v = map[interface{}]interface{}{"import_path": v}
 	}
 
-	mv, ok := v.(yaml.MapSlice)
+	mv, ok := v.(map[interface{}]interface{})
 	if !ok {
-		panic(fmt.Errorf("Dependency value must be string or dict"))
+		panic(fmt.Errorf("Dependency value must be string or dict, got %T: %v", v, v))
 	}
 
 	yaml_copy(mv, &dep)
@@ -251,6 +253,9 @@ func (bf *BegottenFile) set_deps(deps []Dep) {
 }
 
 func (bf *BegottenFile) repo_deps() map[string][]string {
+	if bf.data.Repo_deps == nil {
+		bf.data.Repo_deps = make(map[string][]string)
+	}
 	return bf.data.Repo_deps
 }
 
@@ -396,7 +401,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	for processed_deps < len(b.deps) {
 		repos_to_setup := []string{}
 
-		for _, dep := range b.deps[processed_deps:] {
+		for i, dep := range b.deps[processed_deps:] {
 			have := repo_versions[dep.Git_url]
 
 			if fetch &&
@@ -404,7 +409,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 				have != "" {
 				// Implicit deps take the revision of an explicit dep from the same
 				// repo, if one exists.
-				dep.Ref = have
+				b.deps[processed_deps+i].Ref = have
 				continue
 			}
 
@@ -422,7 +427,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 				repo_versions[dep.Git_url] = want
 				repos_to_setup = append(repos_to_setup, dep.Git_url)
 			}
-			dep.Ref = want
+			b.deps[processed_deps+i].Ref = want
 		}
 
 		processed_deps = len(b.deps)
@@ -446,6 +451,7 @@ func (b *Builder) save_lockfile() *Builder {
 func (b *Builder) _add_implicit_dep(name string, v interface{}) (dep Dep) {
 	dep = b.bf.parse_dep(name, v)
 	//FIXME append: b.deps = b.deps.append(dep)
+	b.deps = append(b.deps, dep)
 	return
 }
 
@@ -465,15 +471,15 @@ func (b *Builder) _repo_dir(url string) string {
 func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (resolved_ref string) {
 	repo_dir := b._repo_dir(url)
 
-	if fi, err := os.Stat(repo_dir); err != nil && !fi.Mode().IsDir() {
-		fmt.Printf("Cloning %s", url)
+	if fi, err := os.Stat(repo_dir); err != nil || !fi.Mode().IsDir() {
+		fmt.Printf("Cloning %s\n", url)
 		cc("/", "git", "clone", "-q", url, repo_dir)
 		// Get into detached head state so we can manipulate things without
 		// worrying about messing up a branch.
 		cc(repo_dir, "git", "checkout", "-q", "--detach")
 	} else if fetched_set != nil {
 		if !fetched_set[url] {
-			fmt.Printf("Updating %s", url)
+			fmt.Printf("Updating %s\n", url)
 			cc(repo_dir, "git", "fetch")
 			fetched_set[url] = true
 		}
@@ -495,7 +501,7 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 	hsh := sha1str(url)[:8]
 	repo_dir := b._repo_dir(url)
 
-	fmt.Printf("Fixing imports in %s", url)
+	fmt.Printf("Fixing imports in %s\n", url)
 	// TODO: can this ever fail (if we made it here)? if so, need to fall back
 	// to fetch first.
 	cc(repo_dir, "git", "reset", "-q", "--hard", resolved_ref)
@@ -530,6 +536,7 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 				sub_dep_map[sub_dep.name] = transitive_name
 				sub_dep.name = transitive_name
 				// FIXME append: b.deps.append(sub_dep)
+				b.deps = append(b.deps, sub_dep)
 			}
 		}
 		// Allow relative import paths within this repo.
@@ -539,6 +546,8 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 				return err
 			} else if fi.IsDir() && basename[0] == '.' {
 				return filepath.SkipDir
+			} else if path == repo_dir {
+				return nil
 			}
 			relpath := path[len(repo_dir)+1:]
 			our_dep := b._lookup_dep_by_git_url_and_path(url, relpath)
@@ -567,6 +576,7 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 	for _, self_dep := range self_deps {
 		if used_rewrites[self_dep.name] {
 			//FIXME append: b.deps.append(self_dep)
+			b.deps = append(b.deps, self_dep)
 		}
 	}
 }
@@ -658,9 +668,9 @@ func (b *Builder) tag_repos() {
 	// Run this after setup_repos.
 	for url, ref := range b._all_repos() {
 		out := co(b._repo_dir(url), "git", "tag", "--force", b._tag_hash(ref))
-		for _, line := range strings.Split(out, "\n") {
+		for _, line := range strings.SplitAfter(out, "\n") {
 			if !strings.HasPrefix(line, "Updated tag ") {
-				fmt.Println(line)
+				fmt.Print(line)
 			}
 		}
 	}
@@ -683,7 +693,7 @@ func (b *Builder) _tag_hash(ref string) string {
 	return "_begot_rewrote_" + sha1str(ref+b.cached_lf_hash)
 }
 
-func (b *Builder) run(args ...string) {
+func (b *Builder) run(args []string) {
 	b._reset_to_tags()
 
 	// Set up code_wk.
@@ -698,12 +708,14 @@ func (b *Builder) run(args ...string) {
 	ln_sf(b.code_root, filepath.Join(b.code_wk, "src"))
 
 	old_deps := make(map[string]bool)
-	// TODO: use filepath.Walk
-	links_str := co("/", "find", depsrc, "-type", "l", "-print0")
-	for _, link := range strings.Split(links_str, "\000") {
-		old_deps[link] = true
+	if fi, err := os.Stat(depsrc); err == nil && fi.IsDir() {
+		// TODO: use filepath.Walk
+		links_str := co("/", "find", depsrc, "-type", "l", "-print0")
+		for _, link := range strings.Split(links_str, "\000") {
+			old_deps[link] = true
+		}
+		delete(old_deps, "")
 	}
-	delete(old_deps, "")
 
 	for _, dep := range b.deps {
 		path := filepath.Join(b.dep_wk, "src", dep.name)
@@ -759,7 +771,10 @@ func (b *Builder) run(args ...string) {
 	// package.
 	empty_go := filepath.Join(empty_dep, "empty.go")
 	if fi, err := os.Stat(empty_go); err != nil || !fi.Mode().IsRegular() {
-		ioutil.WriteFile(empty_go, []byte(fmt.Sprintf("package %s\n", EMPTY_DEP)), 0666)
+		os.MkdirAll(filepath.Dir(empty_go), 0777)
+		if err := ioutil.WriteFile(empty_go, []byte(fmt.Sprintf("package %s\n", EMPTY_DEP)), 0666); err != nil {
+			panic(err)
+		}
 	}
 
 	// Overwrite any existing GOPATH.
@@ -795,7 +810,7 @@ func (b *Builder) clean() {
 	os.Remove(filepath.Join(b.code_root, "bin"))
 }
 
-func get_gopath(env *Env, code_root string) string {
+func get_gopath(env *Env) string {
 	// This duplicates logic in Builder, but we want to just get the GOPATH without
 	// parsing anything.
 	for {
@@ -805,7 +820,7 @@ func get_gopath(env *Env, code_root string) string {
 		if wd, err := os.Getwd(); err != nil {
 			panic(err)
 		} else if wd == "/" {
-			return ""
+			panic(fmt.Errorf("Couldn't find %s file", BEGOTTEN))
 		}
 		if err := os.Chdir(".."); err != nil {
 			panic(err)
@@ -834,8 +849,7 @@ func lock_cache(env *Env) {
 }
 
 func print_help(ret int) {
-	// FIXME
-	//print __doc__.split('---\n')[-1],
+	fmt.Fprintln(os.Stderr, "FIXME")
 	os.Exit(ret)
 }
 
@@ -844,40 +858,38 @@ func main() {
 
 	defer func() {
 		if err := recover(); err != nil {
-			fmt.Printf("Error: %s", err)
+			fmt.Printf("Error: %s\n", err)
 			os.Exit(1)
 		}
 	}()
 
 	lock_cache(env)
 
-	//try:
-	//  cmd = argv[0]
-	//except IndexError:
-	//  print_help()
-	//
-	//if cmd == 'update':
-	//  Builder(use_lockfile=False).setup_repos(fetch=True, limits=argv[1:]).save_lockfile().tag_repos()
-	//elif cmd == 'just_rewrite':
-	//  Builder(use_lockfile=False).setup_repos(fetch=False).save_lockfile().tag_repos()
-	//elif cmd == 'fetch':
-	//  Builder(use_lockfile=True).setup_repos(fetch=False).tag_repos()
-	//elif cmd == 'build':
-	//  Builder(use_lockfile=True).run('go', 'install', './...', EMPTY_DEP)
-	//elif cmd == 'go':
-	//  Builder(use_lockfile=True).run('go', *argv[1:])
-	//elif cmd == 'exec':
-	//  Builder(use_lockfile=True).run(*argv[1:])
-	//elif cmd == 'clean':
-	//  Builder(use_lockfile=False).clean()
-	//elif cmd == 'gopath':
-	//  gopath = get_gopath(env)
-	//  if gopath is None:
-	//    sys.exit(1)
-	//  print gopath
-	//elif cmd == 'help':
-	//  print_help(0)
-	//else:
-	//  print >>sys.stderr, "Unknown subcommand %r" % cmd
-	//  print_help()
+	if len(os.Args) < 2 {
+		print_help(1)
+	}
+
+	switch os.Args[1] {
+	case "update":
+		BuilderNew(env, ".", false).setup_repos(true, os.Args[2:]).save_lockfile().tag_repos()
+	case "just_rewrite":
+		BuilderNew(env, ".", false).setup_repos(false, []string{}).save_lockfile().tag_repos()
+	case "fetch":
+		BuilderNew(env, ".", true).setup_repos(false, []string{}).tag_repos()
+	case "build":
+		BuilderNew(env, ".", true).run([]string{"go", "install", "./...", EMPTY_DEP})
+	case "go":
+		BuilderNew(env, ".", true).run(append([]string{"go"}, os.Args[2:]...))
+	case "exec":
+		BuilderNew(env, ".", true).run(os.Args[2:])
+	case "clean":
+		BuilderNew(env, ".", false).clean()
+	case "gopath":
+		fmt.Println(get_gopath(env))
+	case "help":
+		print_help(0)
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown subcommand %q\n", os.Args[1])
+		print_help(1)
+	}
 }

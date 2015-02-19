@@ -28,7 +28,12 @@ def mkdir_p(*dirs):
 
 def begot(*args):
   print '+', 'begot', ' '.join(args)
-  out = co((BEGOT,) + args)
+  try:
+    out = co((BEGOT,) + args)
+  except subprocess.CalledProcessError, e:
+    for line in e.output.splitlines():
+      print '!', line
+    raise
   for line in out.splitlines():
     print ' ', line
   return out
