@@ -3,9 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -594,48 +597,50 @@ func (b *Builder) _rewrite_imports(repo_dir string, sub_dep_map *map[string]stri
 }
 
 func (b *Builder) _rewrite_file(path string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
-	// FIXME: Ew ew ew.. do this using the go parser.
 	bts, err := ioutil.ReadFile(path)
 	if err != nil {
 		panic(err)
 	}
-	code := strings.SplitAfter(string(bts), "\n")
-	inimports := false
-	for i, line := range code {
-		rewrite := inimports
-		if inimports && strings.Contains(line, ")") {
-			inimports = false
-		} else if strings.HasPrefix(line, "import (") {
-			inimports = true
-		} else if strings.HasPrefix(line, "import ") {
-			rewrite = true
-		}
-		if rewrite {
-			code[i] = b._rewrite_line(line, sub_dep_map, used_rewrites)
+
+	fs := token.NewFileSet()
+	f, err := parser.ParseFile(fs, path, bts, parser.ImportsOnly)
+	if err != nil {
+		panic(err)
+	}
+
+	var pos int
+	var out bytes.Buffer
+	out.Grow(len(bts) * 5 / 4)
+
+	for _, imp := range f.Imports {
+		start := fs.Position(imp.Path.Pos()).Offset
+		end := fs.Position(imp.Path.End()).Offset
+		orig_import := string(bts[start+1 : end-1])
+		rewritten := b._rewrite_import(orig_import, sub_dep_map, used_rewrites)
+		if orig_import != rewritten {
+			out.Write(bts[pos : start+1])
+			out.WriteString(rewritten)
+			pos = end - 1
 		}
 	}
-	out := strings.Join(code, "")
-	if err := ioutil.WriteFile(path, []byte(out), 0666); err != nil {
+	out.Write(bts[pos:])
+
+	if err := ioutil.WriteFile(path, out.Bytes(), 0666); err != nil {
 		panic(err)
 	}
 }
 
-var RE_IN_QUOTES = regexp.MustCompile("\".+?\"")
-
-func (b *Builder) _rewrite_line(line string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) string {
-	return RE_IN_QUOTES.ReplaceAllStringFunc(line, func(imp string) string {
-		imp = imp[1 : len(imp)-1] // strip quotes
-		if rewrite, ok := (*sub_dep_map)[imp]; ok {
-			imp = rewrite
-			(*used_rewrites)[rewrite] = true
-		} else {
-			parts := strings.Split(imp, "/")
-			if _, ok := KNOWN_GIT_SERVERS[parts[0]]; ok {
-				imp = b._lookup_dep_name(imp)
-			}
+func (b *Builder) _rewrite_import(imp string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) string {
+	if rewrite, ok := (*sub_dep_map)[imp]; ok {
+		imp = rewrite
+		(*used_rewrites)[rewrite] = true
+	} else {
+		parts := strings.Split(imp, "/")
+		if _, ok := KNOWN_GIT_SERVERS[parts[0]]; ok {
+			imp = b._lookup_dep_name(imp)
 		}
-		return "\"" + imp + "\""
-	})
+	}
+	return imp
 }
 
 func (b *Builder) _lookup_dep_name(imp string) string {
