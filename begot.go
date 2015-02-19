@@ -702,23 +702,24 @@ func (b *Builder) run(args []string) {
 	empty_dep := filepath.Join(depsrc, EMPTY_DEP)
 	os.MkdirAll(filepath.Join(cbin, empty_dep), 0777)
 	if _, err := ln_sf(cbin, filepath.Join(b.code_root, "bin")); err != nil {
-		panic("It looks like you have an existing 'bin' directory. " +
-			"Please remove it before using begot.")
+		panic(fmt.Errorf("It looks like you have an existing 'bin' directory. " +
+			"Please remove it before using begot."))
 	}
 	ln_sf(b.code_root, filepath.Join(b.code_wk, "src"))
 
-	old_deps := make(map[string]bool)
-	if fi, err := os.Stat(depsrc); err == nil && fi.IsDir() {
-		// TODO: use filepath.Walk
-		links_str := co("/", "find", depsrc, "-type", "l", "-print0")
-		for _, link := range strings.Split(links_str, "\000") {
-			old_deps[link] = true
+	old_links := make(map[string]bool)
+	filepath.Walk(depsrc, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-		delete(old_deps, "")
-	}
+		if fi.Mode()&os.ModeType == os.ModeSymlink {
+			old_links[path] = true
+		}
+		return nil
+	})
 
 	for _, dep := range b.deps {
-		path := filepath.Join(b.dep_wk, "src", dep.name)
+		path := filepath.Join(depsrc, dep.name)
 		target := filepath.Join(b._repo_dir(dep.Git_url), dep.Subpath)
 		if created, err := ln_sf(target, path); err != nil {
 			panic(err)
@@ -733,24 +734,28 @@ func (b *Builder) run(args []string) {
 				os.RemoveAll(pkg)
 			}
 		}
-		delete(old_deps, path)
+		delete(old_links, path)
 	}
 
-	// Remove unexpected deps.
-	if len(old_deps) > 0 {
-		for old_dep := range old_deps {
-			os.RemoveAll(old_dep)
+	// Remove unexpected links.
+	for old_link := range old_links {
+		os.RemoveAll(old_link)
+	}
+
+	// Try to remove all directories; ignore ENOTEMPTY errors.
+	var dirs []string
+	filepath.Walk(depsrc, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
 		}
-		// Try to remove all directories; ignore ENOTEMPTY errors.
-		// TODO: use filepath.Walk
-		dirs_str := co("/", "find", depsrc, "-depth", "-type", "d", "-print0")
-		for _, dir := range strings.Split(dirs_str, "\000") {
-			if dir == "" {
-				continue
-			}
-			if err := syscall.Rmdir(dir); err != nil && err != syscall.ENOTEMPTY {
-				panic(err)
-			}
+		if fi.IsDir() {
+			dirs = append(dirs, path)
+		}
+		return nil
+	})
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := syscall.Rmdir(dirs[i]); err != nil && err != syscall.ENOTEMPTY {
+			panic(err)
 		}
 	}
 
