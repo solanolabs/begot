@@ -6,12 +6,13 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-	//import sys, os, fcntl, re, subprocess, hashlib, errno, shutil, fnmatch, glob
-	//import yaml
+	"syscall"
 
 	"gopkg.in/yaml.v2"
 )
@@ -38,15 +39,32 @@ var KNOWN_GIT_SERVERS = map[string]int{
 	"begot.test":    2,
 }
 
-var NON_IDENTIFIER_CHAR = regexp.MustCompile("\\W")
+var RE_NON_IDENTIFIER_CHAR = regexp.MustCompile("\\W")
 
-//FIXMEtype BegottenFileError error
-//FIXMEtype DependencyError error
-
-func cc(cwd string, args ...string) {
+func replace_non_identifier_chars(in string) string {
+	return RE_NON_IDENTIFIER_CHAR.ReplaceAllLiteralString(in, "_")
 }
 
-func co(cwd string, args ...string) (out string) {
+func Command(cwd string, name string, args ...string) (cmd *exec.Cmd) {
+	cmd = exec.Command(name, args...)
+	cmd.Dir = cwd
+	return
+}
+
+func cc(cwd string, name string, args ...string) {
+	cmd := Command(cwd, name, args...)
+	if err := cmd.Run(); err != nil {
+		panic(err)
+	}
+}
+
+func co(cwd string, name string, args ...string) string {
+	cmd := Command(cwd, name, args...)
+	if outb, err := cmd.Output(); err != nil {
+		panic(err)
+	} else {
+		return string(outb)
+	}
 }
 
 func contains_str(lst []string, val string) bool {
@@ -59,11 +77,13 @@ func contains_str(lst []string, val string) bool {
 }
 
 func sha1str(in string) string {
-	return hex.EncodeToString(sha1.Sum([]byte(in)))
+	sum := sha1.Sum([]byte(in))
+	return hex.EncodeToString(sum[:])
 }
 
 func sha1bts(in []byte) string {
-	return hex.EncodeToString(sha1.Sum(in))
+	sum := sha1.Sum(in)
+	return hex.EncodeToString(sum[:])
 }
 
 func realpath(path string) (out string) {
@@ -79,7 +99,7 @@ func ln_sf(target, path string) (created bool) {
 	current, err := os.Readlink(path)
 	if err != nil || current != target {
 		os.RemoveAll(path)
-		os.MkdirAll(filepath.Dirname(path))
+		os.MkdirAll(filepath.Dir(path), 0777)
 		os.Symlink(target, path)
 		created = true
 	}
@@ -103,6 +123,7 @@ type Dep struct {
 	Aliases     []string
 }
 
+// A Begotten or Begotten.lock file contains exactly one of these in YAML format.
 type BegottenFileStruct struct {
 	Meta struct {
 		File_version int
@@ -119,30 +140,27 @@ type BegottenFile struct {
 
 func BegottenFileNew(fn string) (bf *BegottenFile) {
 	bf = new(BegottenFile)
-	bf.Meta.File_version = -1
+	bf.data.Meta.File_version = -1
 	if data, err := ioutil.ReadFile(fn); err != nil {
 		panic(err)
-	}
-	if err := yaml.Unmarshal(data, &bf.data); err != nil {
+	} else if err := yaml.Unmarshal(data, &bf.data); err != nil {
 		panic(err)
 	}
 	ver := bf.data.Meta.File_version
 	if ver != -1 && ver != FILE_VERSION {
 		panic(fmt.Errorf("Incompatible file version for %r; please run 'begot update'.", ver))
 	}
+	return
 }
 
 func (bf *BegottenFile) save(fn string) {
-	bf.Meta.File_version = FILE_VERSION
-	bf.Meta.Generated_by = CODE_VERSION
+	bf.data.Meta.File_version = FILE_VERSION
+	bf.data.Meta.Generated_by = CODE_VERSION
 	if data, err := yaml.Marshal(bf.data); err != nil {
 		panic(err)
-	}
-	if f, err := os.OpenFile(fn, os.O_WRONLY|os.O_TRUNC, 0666); err != nil {
+	} else if err := ioutil.WriteFile(fn, data, 0666); err != nil {
 		panic(err)
 	}
-	f.Write(data)
-	f.Close()
 }
 
 func (bf *BegottenFile) default_git_url_from_repo_path(repo_path string) string {
@@ -158,7 +176,7 @@ func (bf *BegottenFile) default_git_url_from_repo_path(repo_path string) string 
 func (bf *BegottenFile) parse_dep(name string, v interface{}) (dep Dep) {
 	dep.name = name
 
-	if str, ok := v.(string); ok {
+	if _, ok := v.(string); ok {
 		v = yaml.MapSlice{yaml.MapItem{"import_path", v}}
 	}
 
@@ -209,9 +227,9 @@ func (bf *BegottenFile) parse_dep(name string, v interface{}) (dep Dep) {
 }
 
 func (bf *BegottenFile) deps() (out []Dep) {
-	out = make([]Dep, len(bf.raw.Deps))
+	out = make([]Dep, len(bf.data.Deps))
 	i := 0
-	for name, v := range bf.raw.Deps {
+	for name, v := range bf.data.Deps {
 		out[i] = bf.parse_dep(name, v)
 		i++
 	}
@@ -219,7 +237,10 @@ func (bf *BegottenFile) deps() (out []Dep) {
 }
 
 func (bf *BegottenFile) set_deps(deps []Dep) {
-	bf.data.Deps = deps
+	bf.data.Deps = make(map[string]interface{})
+	for _, dep := range deps {
+		bf.data.Deps[dep.name] = dep
+	}
 }
 
 func (bf *BegottenFile) repo_deps() map[string][]string {
@@ -242,7 +263,10 @@ type Env struct {
 func EnvNew() (env *Env) {
 	env = new(Env)
 	env.Home = os.Getenv("HOME")
-	env.BegotCache = os.Getenv("BEGOT_CACHE") || filepath.Join(env.Home, ".cache", "begot")
+	env.BegotCache = os.Getenv("BEGOT_CACHE")
+	if env.BegotCache == "" {
+		env.BegotCache = filepath.Join(env.Home, ".cache", "begot")
+	}
 	env.DepWorkspaceDir = filepath.Join(env.BegotCache, "depwk")
 	env.CodeWorkspaceDir = filepath.Join(env.BegotCache, "wk")
 	env.RepoDir = filepath.Join(env.BegotCache, "repo")
@@ -260,8 +284,8 @@ type Builder struct {
 	deps      []Dep
 	repo_deps map[string][]string
 
-	processing_dep string
-	cached_lf_hash string
+	processing_repo string
+	cached_lf_hash  string
 }
 
 func BuilderNew(env *Env, code_root string, use_lockfile bool) (b *Builder) {
@@ -282,12 +306,13 @@ func BuilderNew(env *Env, code_root string, use_lockfile bool) (b *Builder) {
 	b.bf = BegottenFileNew(fn)
 	b.deps = b.bf.deps()
 	b.repo_deps = b.bf.repo_deps()
+	return
 }
 
 func (b *Builder) _all_repos() (out map[string]string) {
 	out = make(map[string]string)
 	for _, dep := range b.deps {
-		out[dep.git_url] = dep.ref
+		out[dep.Git_url] = dep.Ref
 	}
 	return
 }
@@ -303,10 +328,10 @@ func (b *Builder) get_locked_refs_for_update(limits []string) (out map[string]st
 			panic(fmt.Errorf("You must have a %s to do a limited update.", BEGOTTEN_LOCK))
 		}
 	}()
-	bf_lock = BegottenFileNew(filepath.Join(b.code_root, BEGOTTEN_LOCK))
+	bf_lock := BegottenFileNew(filepath.Join(b.code_root, BEGOTTEN_LOCK))
 
-	lock_deps := bg_lock.deps()
-	lock_repo_deps := bg_lock.repo_deps()
+	lock_deps := bf_lock.deps()
+	lock_repo_deps := bf_lock.repo_deps()
 
 	match := func(name string) bool {
 		for _, limit := range limits {
@@ -344,8 +369,8 @@ func (b *Builder) get_locked_refs_for_update(limits []string) (out map[string]st
 	}
 
 	for _, dep := range lock_deps {
-		if !repos_to_update[dep.git_url] {
-			out[dep.git_url] = dep.ref
+		if !repos_to_update[dep.Git_url] {
+			out[dep.Git_url] = dep.Ref
 		}
 	}
 	return
@@ -405,8 +430,8 @@ func (b *Builder) save_lockfile() *Builder {
 }
 
 func (b *Builder) _add_implicit_dep(name string, v interface{}) (dep Dep) {
-	dep = b.bg.parse_dep(name, v)
-	b.deps = b.deps.append(dep)
+	dep = b.bf.parse_dep(name, v)
+	//FIXME append: b.deps = b.deps.append(dep)
 	return
 }
 
@@ -423,26 +448,32 @@ func (b *Builder) _repo_dir(url string) string {
 	return filepath.Join(b.env.RepoDir, sha1str(url))
 }
 
-func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) {
-	//repo_dir = b._repo_dir(url)
-	//if not os.path.isdir(repo_dir):
-	//  print "Cloning %s" % url
-	//  cc(['git', 'clone', '-q', url, repo_dir], cwd='/')
-	//  # Get into detached head state so we can manipulate things without
-	//  # worrying about messing up a branch.
-	//  cc(['git', 'checkout', '-q', '--detach'], cwd=repo_dir)
-	//elif fetched_set is not None:
-	//  if url not in fetched_set:
-	//    print "Updating %s" % url
-	//    cc(['git', 'fetch'], cwd=repo_dir)
-	//    fetched_set.add(url)
-	//
-	//try:
-	//  return co(['git', 'rev-parse', '--verify', 'origin/' + ref],
-	//      cwd=repo_dir, stderr=open('/dev/null', 'w')).strip()
-	//except subprocess.CalledProcessError:
-	//  return co(['git', 'rev-parse', '--verify', ref],
-	//      cwd=repo_dir, stderr=open('/dev/null', 'w')).strip()
+func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (resolved_ref string) {
+	repo_dir := b._repo_dir(url)
+
+	if fi, err := os.Stat(repo_dir); err != nil && !fi.Mode().IsDir() {
+		fmt.Printf("Cloning %s", url)
+		cc("/", "git", "clone", "-q", url, repo_dir)
+		// Get into detached head state so we can manipulate things without
+		// worrying about messing up a branch.
+		cc(repo_dir, "git", "checkout", "-q", "--detach")
+	} else if fetched_set != nil {
+		if !fetched_set[url] {
+			fmt.Printf("Updating %s", url)
+			cc(repo_dir, "git", "fetch")
+			fetched_set[url] = true
+		}
+	}
+
+	for _, pfx := range []string{"origin/", ""} {
+		cmd := Command(repo_dir, "git", "rev-parse", "--verify", pfx+ref)
+		cmd.Stderr = nil
+		if outb, err := cmd.Output(); err == nil {
+			resolved_ref = strings.TrimSpace(string(outb))
+			return
+		}
+	}
+	panic(fmt.Errorf("Can't resolve reference %q for %s", ref, url))
 }
 
 func (b *Builder) _setup_repo(url, resolved_ref string) {
@@ -450,106 +481,143 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 	hsh := sha1str(url)[:8]
 	repo_dir := b._repo_dir(url)
 
-	//print "Fixing imports in %s" % url
+	fmt.Printf("Fixing imports in %s", url)
+	// TODO: can this ever fail (if we made it here)? if so, need to fall back
+	// to fetch first.
+	cc(repo_dir, "git", "reset", "-q", "--hard", resolved_ref)
 	//try:
 	//  cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
 	//except subprocess.CalledProcessError:
 	//  print "Missing local ref %r, updating" % resolved_ref
 	//  cc(['git', 'fetch', '-q'], cwd=repo_dir)
 	//  cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
-	//
-	//# Match up sub-deps to our deps.
-	//sub_dep_map = {}
-	//self_deps = []
-	//sub_bg_path = filepath.Join(repo_dir, BEGOTTEN_LOCK)
-	//if os.path.exists(sub_bg_path):
-	//  sub_bg = Begotten(sub_bg_path)
-	//  # Add implicit and explicit external dependencies.
-	//  for sub_dep in sub_bg.deps():
-	//    b._record_repo_dep(sub_dep.git_url)
-	//    our_dep = b._lookup_dep_by_git_url_and_path(
-	//        sub_dep.git_url, sub_dep.subpath)
-	//    if our_dep is not None:
-	//      if sub_dep.ref != our_dep.ref:
-	//        raise DependencyError(
-	//            "Conflict: %s depends on %s at %s, we depend on it at %s" % (
-	//            url, sub_dep.git_url, sub_dep.ref, our_dep.ref))
-	//      sub_dep_map[sub_dep.name] = our_dep.name
-	//    else:
-	//      # Include a hash of this repo identifier so that if two repos use the
-	//      # same dep name to refer to two different things, they don't conflict
-	//      # when we flatten deps.
-	//      transitive_name = '_begot_transitive_%s/%s' % (hsh, sub_dep.name)
-	//      sub_dep_map[sub_dep.name] = transitive_name
-	//      sub_dep.name = transitive_name
-	//      b.deps.append(sub_dep)
-	//  # Allow relative import paths within this repo.
-	//  for dirpath, dirnames, files in os.walk(repo_dir):
-	//    dirnames[:] = filter(lambda n: n[0] != '.', dirnames)
-	//    for dn in dirnames:
-	//      relpath = filepath.Join(dirpath, dn)[len(repo_dir)+1:]
-	//      our_dep = b._lookup_dep_by_git_url_and_path(url, relpath)
-	//      if our_dep is not None:
-	//        sub_dep_map[relpath] = our_dep.name
-	//      else:
-	//        # See comment on _lookup_dep_name for re.sub rationale.
-	//        self_name = '_begot_self_%s/%s' % (hsh, re.sub(r'\W', '_', relpath))
-	//        sub_dep_map[relpath] = self_name
-	//        self_deps.append(Dep(name=self_name,
-	//          git_url=url, subpath=relpath, ref=resolved_ref, aliases=[]))
-	//
-	//used_rewrites = {}
-	//b._rewrite_imports(repo_dir, sub_dep_map, used_rewrites)
-	//msg = 'rewritten by begot for %s' % b.code_root
-	//cc(['git', 'commit', '--allow-empty', '-a', '-q', '-m', msg], cwd=repo_dir)
-	//
-	//# Add only the self-deps that were used, to reduce clutter.
-	//vals = set(used_rewrites.values())
-	//b.deps.extend(dep for dep in self_deps if dep.name in vals)
+
+	// Match up sub-deps to our deps.
+	sub_dep_map := make(map[string]string)
+	self_deps := []Dep{}
+	sub_bg_path := filepath.Join(repo_dir, BEGOTTEN_LOCK)
+	if _, err := os.Stat(sub_bg_path); err == nil {
+		sub_bg := BegottenFileNew(sub_bg_path)
+		// Add implicit and explicit external dependencies.
+		for _, sub_dep := range sub_bg.deps() {
+			b._record_repo_dep(sub_dep.Git_url)
+			our_dep := b._lookup_dep_by_git_url_and_path(sub_dep.Git_url, sub_dep.Subpath)
+			if our_dep != nil {
+				if sub_dep.Ref != our_dep.Ref {
+					panic(fmt.Sprintf("Conflict: %s depends on %s at %s, we depend on it at %s",
+						url, sub_dep.Git_url, sub_dep.Ref, our_dep.Ref))
+				}
+				sub_dep_map[sub_dep.name] = our_dep.name
+			} else {
+				// Include a hash of this repo identifier so that if two repos use the
+				// same dep name to refer to two different things, they don't conflict
+				// when we flatten deps.
+				transitive_name := fmt.Sprintf("_begot_transitive_%s/%s", hsh, sub_dep.name)
+				sub_dep_map[sub_dep.name] = transitive_name
+				sub_dep.name = transitive_name
+				// FIXME append: b.deps.append(sub_dep)
+			}
+		}
+		// Allow relative import paths within this repo.
+		e := filepath.Walk(repo_dir, func(path string, fi os.FileInfo, err error) error {
+			basename := filepath.Base(path)
+			if err != nil {
+				return err
+			} else if fi.IsDir() && basename[0] == '.' {
+				return filepath.SkipDir
+			}
+			relpath := path[len(repo_dir)+1:]
+			our_dep := b._lookup_dep_by_git_url_and_path(url, relpath)
+			if our_dep != nil {
+				sub_dep_map[relpath] = our_dep.name
+			} else {
+				// See comment on _lookup_dep_name for rationale.
+				self_name := fmt.Sprintf("_begot_self_%s/%s", hsh, replace_non_identifier_chars(relpath))
+				sub_dep_map[relpath] = self_name
+				self_deps = append(self_deps, Dep{
+					name: self_name, Git_url: url, Subpath: relpath, Ref: resolved_ref})
+			}
+			return nil
+		})
+		if e != nil {
+			panic(e)
+		}
+	}
+
+	used_rewrites := make(map[string]bool)
+	b._rewrite_imports(repo_dir, &sub_dep_map, &used_rewrites)
+	msg := fmt.Sprintf("rewritten by begot for %s", b.code_root)
+	cc(repo_dir, "git", "commit", "--allow-empty", "-a", "-q", "-m", msg)
+
+	// Add only the self-deps that were used, to reduce clutter.
+	for _, self_dep := range self_deps {
+		if used_rewrites[self_dep.name] {
+			//FIXME append: b.deps.append(self_dep)
+		}
+	}
 }
 
-func (b *Builder) _rewrite_imports(repo_dir string, sub_dep_map FIXME, used_rewrites *map[string]bool) {
-	//for dirpath, dirnames, files in os.walk(repo_dir):
-	//  dirnames[:] = filter(lambda n: n[0] != '.', dirnames)
-	//  for fn in files:
-	//    if fn.endswith('.go'):
-	//      b._rewrite_file(filepath.Join(dirpath, fn), sub_dep_map, used_rewrites)
+func (b *Builder) _rewrite_imports(repo_dir string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
+	filepath.Walk(repo_dir, func(path string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasSuffix(path, ".go") {
+			b._rewrite_file(path, sub_dep_map, used_rewrites)
+		}
+		return nil
+	})
 }
 
-func (b *Builder) _rewrite_file(path string, sub_dep_map FIXME, used_rewrites *map[string]bool) {
-	//# TODO: Ew ew ew.. do this using the go parser.
-	//code = open(path).read().splitlines(True)
-	//inimports = False
-	//for i, line in enumerate(code):
-	//  rewrite = inimports
-	//  if inimports and ')' in line:
-	//      inimports = False
-	//  elif line.startswith('import ('):
-	//    inimports = True
-	//  elif line.startswith('import '):
-	//    rewrite = True
-	//  if rewrite:
-	//    code[i] = b._rewrite_line(line, sub_dep_map, used_rewrites)
-	//open(path, 'w').write(''.filepath.Join(code))
+func (b *Builder) _rewrite_file(path string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
+	// FIXME: Ew ew ew.. do this using the go parser.
+	bts, err := ioutil.ReadFile(path)
+	if err != nil {
+		panic(err)
+	}
+	code := strings.SplitAfter(string(bts), "\n")
+	inimports := false
+	for i, line := range code {
+		rewrite := inimports
+		if inimports && strings.Contains(line, ")") {
+			inimports = false
+		} else if strings.HasPrefix(line, "import (") {
+			inimports = true
+		} else if strings.HasPrefix(line, "import ") {
+			rewrite = true
+		}
+		if rewrite {
+			code[i] = b._rewrite_line(line, sub_dep_map, used_rewrites)
+		}
+	}
+	out := strings.Join(code, "")
+	if err := ioutil.WriteFile(path, []byte(out), 0666); err != nil {
+		panic(err)
+	}
 }
 
-func (b *Builder) _rewrite_line(line string, sub_dep_map FIXME, used_rewrites *map[string]bool) {
-	//def repl(m):
-	//  imp = m.group(1)
-	//  if imp in sub_dep_map:
-	//    imp = used_rewrites[imp] = sub_dep_map[imp]
-	//  else:
-	//    parts = imp.split('/')
-	//    if parts[0] in KNOWN_GIT_SERVERS:
-	//      imp = b._lookup_dep_name(imp)
-	//  return '"%s"' % imp
-	//return re.sub(r'"([^"]+)"', repl, line)
+var RE_IN_QUOTES = regexp.MustCompile("\".+?\"")
+
+func (b *Builder) _rewrite_line(line string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) string {
+	return RE_IN_QUOTES.ReplaceAllStringFunc(line, func(imp string) string {
+		imp = imp[1 : len(imp)-1] // strip quotes
+		if rewrite, ok := (*sub_dep_map)[imp]; ok {
+			imp = rewrite
+			(*used_rewrites)[rewrite] = true
+		} else {
+			parts := strings.Split(imp, "/")
+			if _, ok := KNOWN_GIT_SERVERS[parts[0]]; ok {
+				imp = b._lookup_dep_name(imp)
+			}
+		}
+		return "\"" + imp + "\""
+	})
 }
 
 func (b *Builder) _lookup_dep_name(imp string) string {
 	for _, dep := range b.deps {
-		if contains_str(dep.aliases, imp) {
-			b._record_repo_dep(dep.git_url)
+		if contains_str(dep.Aliases, imp) {
+			b._record_repo_dep(dep.Git_url)
 			return dep.name
 		}
 	}
@@ -557,15 +625,15 @@ func (b *Builder) _lookup_dep_name(imp string) string {
 	// Each dep turns into a symlink at build time. Packages can be nested, so we
 	// might depend on 'a' and 'a/b'. If we create a symlink for 'a', we can't
 	// also create 'a/b'. So rename it to 'a_b'.
-	name := "_begot_implicit/" + NON_IDENTIFIER_CHAR.ReplaceAllLiteralString(imp, "_")
+	name := "_begot_implicit/" + replace_non_identifier_chars(imp)
 	dep := b._add_implicit_dep(name, imp)
-	b._record_repo_dep(dep.git_url)
+	b._record_repo_dep(dep.Git_url)
 	return name
 }
 
 func (b *Builder) _lookup_dep_by_git_url_and_path(git_url string, subpath string) *Dep {
 	for _, dep := range b.deps {
-		if dep.git_url == git_url && dep.subpath == subpath {
+		if dep.Git_url == git_url && dep.Subpath == subpath {
 			return &dep
 		}
 	}
@@ -584,14 +652,14 @@ func (b *Builder) tag_repos() {
 	}
 }
 
-func (b *Builder) _tag_hash(ref, cached_lf_hash /*=[]*/) {
+func (b *Builder) _tag_hash(ref string) string {
 	// We want to tag the current state with a name that depends on:
 	// 1. The base ref that we rewrote from.
 	// 2. The full set of deps that describe how we rewrote imports.
 	// The contents of Begotten.lock suffice for (2):
 
 	if b.cached_lf_hash == "" {
-		lockfile = filepath.Join(b.code_root, BEGOTTEN_LOCK)
+		lockfile := filepath.Join(b.code_root, BEGOTTEN_LOCK)
 		if bts, err := ioutil.ReadFile(lockfile); err != nil {
 			panic(err)
 		} else {
@@ -695,12 +763,12 @@ func get_gopath(env *Env, code_root string) string {
 	// This duplicates logic in Builder, but we want to just get the GOPATH without
 	// parsing anything.
 	for {
-		if _, err := os.Stat(env.BEGOTTEN); err == nil {
+		if _, err := os.Stat(BEGOTTEN); err == nil {
 			break
 		}
 		if wd, err := os.Getwd(); err != nil {
 			panic(err)
-		} else if wc == "/" {
+		} else if wd == "/" {
 			return ""
 		}
 		if err := os.Chdir(".."); err != nil {
@@ -713,16 +781,16 @@ func get_gopath(env *Env, code_root string) string {
 	return code_wk + ":" + dep_wk
 }
 
-var _cache_lock *File
+var _cache_lock *os.File
 
 func lock_cache(env *Env) {
-	os.MkdirAll(env.BegotCache)
-	_cache_lock, err := os.OpenFile(env.CacheLock, os.O_CREAT|os.O_RDWR)
+	os.MkdirAll(env.BegotCache, 0777)
+	_cache_lock, err := os.OpenFile(env.CacheLock, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		panic(err)
 	}
-	err = syscall.Flock(_cache_lock.Fd(), syscall.LOCK_EX|syscall.LOCK_NB)
-	if err {
+	err = syscall.Flock(int(_cache_lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
 		panic(fmt.Errorf("Can't lock %r", env.BegotCache))
 	}
 	// Leave file open for lifetime of this process and anything exec'd by this
