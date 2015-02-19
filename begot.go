@@ -21,7 +21,8 @@ const (
 	BEGOTTEN      = "Begotten"
 	BEGOTTEN_LOCK = "Begotten.lock"
 
-	EMPTY_DEP = "_begot_empty_dep"
+	EMPTY_DEP       = "_begot_empty_dep"
+	IMPLICIT_PREFIX = "_begot_implicit"
 
 	// This is an identifier for the version of begot. It gets written into
 	// Begotten.lock.
@@ -95,12 +96,18 @@ func realpath(path string) (out string) {
 	return
 }
 
-func ln_sf(target, path string) (created bool) {
-	current, err := os.Readlink(path)
-	if err != nil || current != target {
-		os.RemoveAll(path)
-		os.MkdirAll(filepath.Dir(path), 0777)
-		os.Symlink(target, path)
+func ln_sf(target, path string) (created bool, err error) {
+	current, e := os.Readlink(path)
+	if e != nil || current != target {
+		if err = os.RemoveAll(path); err != nil {
+			return
+		}
+		if err = os.MkdirAll(filepath.Dir(path), 0777); err != nil {
+			return
+		}
+		if err = os.Symlink(target, path); err != nil {
+			return
+		}
 		created = true
 	}
 	return
@@ -376,49 +383,56 @@ func (b *Builder) get_locked_refs_for_update(limits []string) (out map[string]st
 	return
 }
 
-func (b *Builder) setup_repos(fetch bool, limits []string) {
-	//processed_deps = 0
-	//repo_versions = {}
-	//if fetch:
-	//  fetched_set = set()
-	//else:
-	//  fetched_set = None
-	//
-	//locked_refs = b.get_locked_refs_for_update(limits)
-	//
-	//while processed_deps < len(b.deps):
-	//  repos_to_setup = []
-	//
-	//  for dep in b.deps[processed_deps:]:
-	//    have = repo_versions.get(dep.git_url)
-	//
-	//    if fetch and dep.name.startswith('_begot_implicit/') and have is not None:
-	//      # Implicit deps take the revision of an explicit dep from the same
-	//      # repo, if one exists.
-	//      dep.ref = have
-	//      continue
-	//
-	//    want = locked_refs.get(dep.git_url)
-	//    if want is None:
-	//      want = b._resolve_ref(dep.git_url, dep.ref, fetched_set)
-	//
-	//    if have is not None:
-	//      if have != want:
-	//        raise DependencyError(
-	//            "Conflicting versions for %r: have %s, want %s (%s)" % (
-	//            dep.name, have, want, dep.ref))
-	//    else:
-	//      repo_versions[dep.git_url] = want
-	//      repos_to_setup.append(dep.git_url)
-	//    dep.ref = want
-	//
-	//  processed_deps = len(b.deps)
-	//
-	//  # This will add newly-found dependencies to b.deps.
-	//  for url in repos_to_setup:
-	//    b._setup_repo(url, repo_versions[url])
-	//
-	//return self
+func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
+	processed_deps := 0
+	repo_versions := make(map[string]string)
+	var fetched_set map[string]bool
+	if fetch {
+		fetched_set = make(map[string]bool)
+	}
+
+	locked_refs := b.get_locked_refs_for_update(limits)
+
+	for processed_deps < len(b.deps) {
+		repos_to_setup := []string{}
+
+		for _, dep := range b.deps[processed_deps:] {
+			have := repo_versions[dep.Git_url]
+
+			if fetch &&
+				strings.HasPrefix(dep.name, IMPLICIT_PREFIX) &&
+				have != "" {
+				// Implicit deps take the revision of an explicit dep from the same
+				// repo, if one exists.
+				dep.Ref = have
+				continue
+			}
+
+			want := locked_refs[dep.Git_url]
+			if want == "" {
+				want = b._resolve_ref(dep.Git_url, dep.Ref, fetched_set)
+			}
+
+			if have != "" {
+				if have != want {
+					panic(fmt.Errorf("Conflicting versions for %r: have %s, want %s (%s)",
+						dep.name, have, want, dep.Ref))
+				}
+			} else {
+				repo_versions[dep.Git_url] = want
+				repos_to_setup = append(repos_to_setup, dep.Git_url)
+			}
+			dep.Ref = want
+		}
+
+		processed_deps = len(b.deps)
+
+		// This will add newly-found dependencies to b.deps.
+		for _, url := range repos_to_setup {
+			b._setup_repo(url, repo_versions[url])
+		}
+	}
+	return b
 }
 
 func (b *Builder) save_lockfile() *Builder {
@@ -625,7 +639,7 @@ func (b *Builder) _lookup_dep_name(imp string) string {
 	// Each dep turns into a symlink at build time. Packages can be nested, so we
 	// might depend on 'a' and 'a/b'. If we create a symlink for 'a', we can't
 	// also create 'a/b'. So rename it to 'a_b'.
-	name := "_begot_implicit/" + replace_non_identifier_chars(imp)
+	name := IMPLICIT_PREFIX + replace_non_identifier_chars(imp)
 	dep := b._add_implicit_dep(name, imp)
 	b._record_repo_dep(dep.Git_url)
 	return name
@@ -670,84 +684,106 @@ func (b *Builder) _tag_hash(ref string) string {
 }
 
 func (b *Builder) run(args ...string) {
-	//try:
-	//  b._reset_to_tags()
-	//except subprocess.CalledProcessError:
-	//  print >>sys.stderr, ("Begotten.lock refers to a missing local commit. "
-	//      "Please run 'begot fetch' first.")
-	//  sys.exit(1)
+	b._reset_to_tags()
+
+	// Set up code_wk.
+	cbin := filepath.Join(b.code_wk, "bin")
+	depsrc := filepath.Join(b.dep_wk, "src")
+	empty_dep := filepath.Join(depsrc, EMPTY_DEP)
+	os.MkdirAll(filepath.Join(cbin, empty_dep), 0777)
+	if _, err := ln_sf(cbin, filepath.Join(b.code_root, "bin")); err != nil {
+		panic("It looks like you have an existing 'bin' directory. " +
+			"Please remove it before using begot.")
+	}
+	ln_sf(b.code_root, filepath.Join(b.code_wk, "src"))
+
+	old_deps := make(map[string]bool)
+	// TODO: use filepath.Walk
+	links_str := co("/", "find", depsrc, "-type", "l", "-print0")
+	for _, link := range strings.Split(links_str, "\000") {
+		old_deps[link] = true
+	}
+	delete(old_deps, "")
+
+	for _, dep := range b.deps {
+		path := filepath.Join(b.dep_wk, "src", dep.name)
+		target := filepath.Join(b._repo_dir(dep.Git_url), dep.Subpath)
+		if created, err := ln_sf(target, path); err != nil {
+			panic(err)
+		} else if created {
+			// If we've created or changed this symlink, any pkg files that go may
+			// have compiled from it should be invalidated.
+			// Note: This makes some assumptions about go's build layout. It should
+			// be safe enough, though it may be simpler to just blow away everything
+			// if any dep symlinks change.
+			pkgs, _ := filepath.Glob(filepath.Join(b.dep_wk, "pkg", "*", dep.name+".*"))
+			for _, pkg := range pkgs {
+				os.RemoveAll(pkg)
+			}
+		}
+		delete(old_deps, path)
+	}
+
+	// Remove unexpected deps.
+	if len(old_deps) > 0 {
+		for old_dep := range old_deps {
+			os.RemoveAll(old_dep)
+		}
+		// Try to remove all directories; ignore ENOTEMPTY errors.
+		// TODO: use filepath.Walk
+		dirs_str := co("/", "find", depsrc, "-depth", "-type", "d", "-print0")
+		for _, dir := range strings.Split(dirs_str, "\000") {
+			if dir == "" {
+				continue
+			}
+			if err := syscall.Rmdir(dir); err != nil && err != syscall.ENOTEMPTY {
+				panic(err)
+			}
+		}
+	}
+
+	// Set up empty dep.
 	//
-	//# Set up code_wk.
-	//cbin = filepath.Join(b.code_wk, 'bin')
-	//depsrc = filepath.Join(b.dep_wk, 'src')
-	//empty_dep = filepath.Join(depsrc, EMPTY_DEP)
-	//os.MkdirAll(cbin, empty_dep)
-	//try:
-	//  _ln_sf(cbin, filepath.Join(b.code_root, 'bin'))
-	//except OSError:
-	//  print >>sys.stderr, "It looks like you have an existing 'bin' directory."
-	//  print >>sys.stderr, "Please remove it before using begot."
-	//  sys.exit(1)
-	//_ln_sf(b.code_root, filepath.Join(b.code_wk, 'src'))
+	// The go tool tries to be helpful by not rebuilding modified code if that
+	// code is in a workspace and no packages from that workspace are mentioned
+	// on the command line. See cmd/go/pkg.go:isStale around line 680.
 	//
-	//old_deps = set(co(['find', depsrc, '-type', 'l', '-print0']).split('\0'))
-	//old_deps.discard('')
+	// We are explicitly managing all of the workspaces in our GOPATH and do
+	// indeed want to rebuild everything when dependencies change. That is
+	// required by the goal of reproducible builds: the alternative would mean
+	// what you get for this build depends on the state of a previous build.
 	//
-	//for dep in b.deps:
-	//  path = filepath.Join(b.dep_wk, 'src', dep.name)
-	//  target = filepath.Join(b._repo_dir(dep.git_url), dep.subpath)
-	//  if _ln_sf(target, path):
-	//    # If we've created or changed this symlink, any pkg files that go may
-	//    # have compiled from it should be invalidated.
-	//    # Note: This makes some assumptions about go's build layout. It should
-	//    # be safe enough, though it may be simpler to just blow away everything
-	//    # if any dep symlinks change.
-	//    os.RemoveAll(*glob.glob(filepath.Join(b.dep_wk, 'pkg', '*', dep.name + '.*')))
-	//  old_deps.discard(path)
-	//
-	//# Remove unexpected deps.
-	//if old_deps:
-	//  for old_dep in old_deps:
-	//    os.remove(old_dep)
-	//  for dir in co(['find', depsrc, '-depth', '-type', 'd', '-print0']).split('\0'):
-	//    if not dir: continue
-	//    try:
-	//      os.rmdir(dir)
-	//    except OSError, e:
-	//      if e.errno != errno.ENOTEMPTY:
-	//        raise
-	//
-	//# Set up empty dep.
-	//#
-	//# The go tool tries to be helpful by not rebuilding modified code if that
-	//# code is in a workspace and no packages from that workspace are mentioned
-	//# on the command line. See cmd/go/pkg.go:isStale around line 680.
-	//#
-	//# We are explicitly managing all of the workspaces in our GOPATH and do
-	//# indeed want to rebuild everything when dependencies change. That is
-	//# required by the goal of reproducible builds: the alternative would mean
-	//# what you get for this build depends on the state of a previous build.
-	//#
-	//# The go tool doesn't provide any way of disabling this "helpful"
-	//# functionality. The simplest workaround is to always mention a package from
-	//# the dependency workspace on the command line. Hence, we add an empty
-	//# package.
-	//empty_go = filepath.Join(empty_dep, 'empty.go')
-	//if not os.path.isfile(empty_go):
-	//  open(empty_go, 'w').write('package %s\n' % EMPTY_DEP)
-	//
-	//# Overwrite any existing GOPATH.
-	//os.putenv('GOPATH', ':'.filepath.Join((b.code_wk, b.dep_wk)))
-	//os.chdir(b.code_root)
-	//os.execvp(args[0], args)
+	// The go tool doesn't provide any way of disabling this "helpful"
+	// functionality. The simplest workaround is to always mention a package from
+	// the dependency workspace on the command line. Hence, we add an empty
+	// package.
+	empty_go := filepath.Join(empty_dep, "empty.go")
+	if fi, err := os.Stat(empty_go); err != nil || !fi.Mode().IsRegular() {
+		ioutil.WriteFile(empty_go, []byte(fmt.Sprintf("package %s\n", EMPTY_DEP)), 0666)
+	}
+
+	// Overwrite any existing GOPATH.
+	if argv0, err := exec.LookPath(args[0]); err != nil {
+		panic(err)
+	} else {
+		os.Setenv("GOPATH", fmt.Sprintf("%s:%s", b.code_wk, b.dep_wk))
+		os.Chdir(b.code_root)
+		err := syscall.Exec(argv0, args, os.Environ())
+		panic(fmt.Errorf("exec failed: %s", err))
+	}
 }
 
 func (b *Builder) _reset_to_tags() {
+	defer func() {
+		if recover() != nil {
+			panic(fmt.Errorf("Begotten.lock refers to a missing local commit. " +
+				"Please run 'begot fetch' first."))
+		}
+	}()
 	for url, ref := range b._all_repos() {
 		wd := b._repo_dir(url)
 		if fi, err := os.Stat(wd); err != nil || !fi.Mode().IsDir() {
-			panic(fmt.Errorf("Begotten.lock refers to a missing local commit. " +
-				"Please run 'begot fetch' first."))
+			panic("not directory")
 		}
 		cc(wd, "git", "reset", "-q", "--hard", "tags/"+b._tag_hash(ref))
 	}
