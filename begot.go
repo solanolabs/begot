@@ -463,6 +463,8 @@ func (b *Builder) _repo_dir(url string) string {
 	return filepath.Join(b.env.RepoDir, sha1str(url))
 }
 
+var RE_SHA1_HASH = regexp.MustCompile("[[:xdigit:]]{40}")
+
 func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (resolved_ref string) {
 	repo_dir := b._repo_dir(url)
 
@@ -478,6 +480,10 @@ func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (re
 			cc(repo_dir, "git", "fetch")
 			fetched_set[url] = true
 		}
+	}
+
+	if RE_SHA1_HASH.MatchString(ref) {
+		return ref
 	}
 
 	for _, pfx := range []string{"origin/", ""} {
