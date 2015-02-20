@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"gopkg.in/yaml.v2"
@@ -26,7 +27,7 @@ const (
 	BEGOTTEN_LOCK = "Begotten.lock"
 
 	EMPTY_DEP       = "_begot_empty_dep"
-	IMPLICIT_PREFIX = "_begot_implicit"
+	IMPLICIT_PREFIX = "_begot_implicit/"
 
 	// This should change if the format of Begotten.lock changes in an incompatible
 	// way. (But prefer changing it in compatible ways and not incrementing this.)
@@ -335,9 +336,15 @@ type Builder struct {
 	code_root string
 	code_wk   string
 	dep_wk    string
-	bf        *BegottenFile
-	deps      []Dep
-	repo_deps map[string][]string
+
+	bf   *BegottenFile
+	deps []Dep
+
+	repo_deps_lock sync.Mutex
+	repo_deps      map[string][]string
+
+	repo_locks_lock sync.Mutex
+	repo_locks      map[string]*sync.Mutex
 
 	cached_lf_hash string
 }
@@ -360,6 +367,9 @@ func BuilderNew(env *Env, code_root string, use_lockfile bool) (b *Builder) {
 	b.bf = BegottenFileNew(fn)
 	b.deps = b.bf.deps()
 	b.repo_deps = b.bf.repo_deps()
+
+	b.repo_locks = make(map[string]*sync.Mutex)
+
 	return
 }
 
@@ -431,58 +441,121 @@ func (b *Builder) get_locked_refs_for_update(limits []string) (out map[string]st
 }
 
 func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
-	processed_deps := 0
+	var repo_versions_lock sync.Mutex
 	repo_versions := make(map[string]string)
-	var fetched_set map[string]bool
+
+	var should_fetch func(string) bool
 	if fetch {
-		fetched_set = make(map[string]bool)
+		var fetched_set_lock sync.Mutex
+		fetched_set := make(map[string]bool)
+		should_fetch = func(url string) bool {
+			fetched_set_lock.Lock()
+			defer fetched_set_lock.Unlock()
+			if fetched_set[url] {
+				return false
+			} else {
+				fetched_set[url] = true
+				return true
+			}
+		}
 	}
 
 	locked_refs := b.get_locked_refs_for_update(limits)
 
-	for processed_deps < len(b.deps) {
-		repos_to_setup := []string{}
+	var wg sync.WaitGroup
+	incoming := make(chan Dep, 10)
+	outgoing := make(chan Dep, 10)
 
-		for i, dep := range b.deps[processed_deps:] {
-			have := repo_versions[dep.Git_url]
-
-			if fetch &&
-				strings.HasPrefix(dep.name, IMPLICIT_PREFIX) &&
-				have != "" {
-				// Implicit deps take the revision of an explicit dep from the same
-				// repo, if one exists.
-				b.deps[processed_deps+i].Ref = have
-				continue
+	process_dep := func(dep Dep) {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Printf("Error: %s\n", err)
+				os.Exit(1)
 			}
+		}()
 
+		out := dep
+		have := ""
+
+		// Implicit deps take the revision of an explicit dep from the same
+		// repo, if one exists.
+		if fetch && strings.HasPrefix(dep.name, IMPLICIT_PREFIX) {
+			repo_versions_lock.Lock()
+			have = repo_versions[dep.Git_url]
+			repo_versions_lock.Unlock()
+		}
+
+		if have != "" {
+			out.Ref = have
+		} else {
 			want := locked_refs[dep.Git_url]
 			if want == "" {
-				want = b._resolve_ref(dep.Git_url, dep.Ref, fetched_set)
+				want = b._resolve_ref(dep.Git_url, dep.Ref, should_fetch)
 			}
 
+			repo_versions_lock.Lock()
+			have = repo_versions[dep.Git_url]
 			if have != "" {
+				repo_versions_lock.Unlock()
 				if have != want {
-					panic(fmt.Errorf("Conflicting versions for %r: have %s, want %s (%s)",
-						dep.name, have, want, dep.Ref))
+					panic(fmt.Errorf("Conflicting versions for %s: have %s, want %s (%s)",
+						dep.Git_url, have, want, dep.Ref))
 				}
 			} else {
 				repo_versions[dep.Git_url] = want
-				repos_to_setup = append(repos_to_setup, dep.Git_url)
+				repo_versions_lock.Unlock()
+
+				for _, new_dep := range b._setup_repo(dep.Git_url, want) {
+					wg.Add(1)
+					incoming <- new_dep
+				}
 			}
-			b.deps[processed_deps+i].Ref = want
+			out.Ref = want
 		}
-
-		processed_deps = len(b.deps)
-
-		// This will add newly-found dependencies to b.deps.
-		for _, url := range repos_to_setup {
-			b._setup_repo(url, repo_versions[url])
-		}
+		outgoing <- out
+		wg.Done()
 	}
+
+	done := make(chan bool)
+
+	// Process deps.
+	go func() {
+		for dep := range incoming {
+			go process_dep(dep)
+		}
+		done <- true
+	}()
+
+	// Collect outputs.
+	var new_deps []Dep
+	go func() {
+		for new_dep := range outgoing {
+			new_deps = append(new_deps, new_dep)
+		}
+		done <- true
+	}()
+
+	// Throw in all the deps from the file.
+	for _, dep := range b.deps {
+		wg.Add(1)
+		incoming <- dep
+	}
+
+	wg.Wait()
+	close(incoming)
+	close(outgoing)
+	<-done
+	<-done
+
+	b.deps = new_deps
+
 	return b
 }
 
 func (b *Builder) save_lockfile() *Builder {
+	b.repo_deps_lock.Lock()
+	defer b.repo_deps_lock.Unlock()
+
 	// Should only be called when loaded from Begotten, not lockfile.
 	b.bf.set_deps(b.deps)
 	b.bf.set_repo_deps(b.repo_deps)
@@ -491,6 +564,9 @@ func (b *Builder) save_lockfile() *Builder {
 }
 
 func (b *Builder) _record_repo_dep(src_url, dep_url string) {
+	b.repo_deps_lock.Lock()
+	defer b.repo_deps_lock.Unlock()
+
 	if src_url != dep_url {
 		lst := b.repo_deps[src_url]
 		if !contains_str(lst, dep_url) {
@@ -499,14 +575,28 @@ func (b *Builder) _record_repo_dep(src_url, dep_url string) {
 	}
 }
 
+func (b *Builder) _repo_lock(repo_dir string) (lock *sync.Mutex) {
+	b.repo_locks_lock.Lock()
+	defer b.repo_locks_lock.Unlock()
+	if lock = b.repo_locks[repo_dir]; lock == nil {
+		lock = new(sync.Mutex)
+		b.repo_locks[repo_dir] = lock
+	}
+	return lock
+}
+
 func (b *Builder) _repo_dir(url string) string {
 	return filepath.Join(b.env.RepoDir, sha1str(url))
 }
 
 var RE_SHA1_HASH = regexp.MustCompile("[[:xdigit:]]{40}")
 
-func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (resolved_ref string) {
+func (b *Builder) _resolve_ref(url, ref string, should_fetch func(string) bool) (resolved_ref string) {
 	repo_dir := b._repo_dir(url)
+
+	repo_lock := b._repo_lock(repo_dir)
+	repo_lock.Lock()
+	defer repo_lock.Unlock()
 
 	if fi, err := os.Stat(repo_dir); err != nil || !fi.Mode().IsDir() {
 		fmt.Printf("Cloning %s\n", url)
@@ -514,12 +604,9 @@ func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (re
 		// Get into detached head state so we can manipulate things without
 		// worrying about messing up a branch.
 		cc(repo_dir, "git", "checkout", "-q", "--detach")
-	} else if fetched_set != nil {
-		if !fetched_set[url] {
-			fmt.Printf("Updating %s\n", url)
-			cc(repo_dir, "git", "fetch", "-q")
-			fetched_set[url] = true
-		}
+	} else if should_fetch != nil && should_fetch(url) {
+		fmt.Printf("Updating %s\n", url)
+		cc(repo_dir, "git", "fetch", "-q")
 	}
 
 	if RE_SHA1_HASH.MatchString(ref) {
@@ -537,9 +624,13 @@ func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (re
 	panic(fmt.Errorf("Can't resolve reference %q for %s", ref, url))
 }
 
-func (b *Builder) _setup_repo(url, resolved_ref string) {
+func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
 	hsh := sha1str(url)[:8]
 	repo_dir := b._repo_dir(url)
+
+	repo_lock := b._repo_lock(repo_dir)
+	repo_lock.Lock()
+	defer repo_lock.Unlock()
 
 	fmt.Printf("Fixing imports in %s\n", url)
 	cmd := Command(repo_dir, "git", "reset", "-q", "--hard", resolved_ref)
@@ -561,8 +652,9 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 			our_dep := b._lookup_dep_by_git_url_and_path(sub_dep.Git_url, sub_dep.Subpath)
 			if our_dep != nil {
 				if sub_dep.Ref != our_dep.Ref {
-					panic(fmt.Sprintf("Conflict: %s depends on %s at %s, we depend on it at %s",
-						url, sub_dep.Git_url, sub_dep.Ref, our_dep.Ref))
+					real_ref := b._resolve_ref(our_dep.Git_url, our_dep.Ref, nil)
+					panic(fmt.Errorf("Conflict: %s depends on %s at %s, we depend on it at %s (%s)",
+						url, sub_dep.Git_url, sub_dep.Ref, our_dep.Ref, real_ref))
 				}
 				sub_dep_map[sub_dep.name] = our_dep.name
 			} else {
@@ -572,7 +664,7 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 				transitive_name := fmt.Sprintf("_begot_transitive_%s/%s", hsh, sub_dep.name)
 				sub_dep_map[sub_dep.name] = transitive_name
 				sub_dep.name = transitive_name
-				b.deps = append(b.deps, sub_dep)
+				new_deps = append(new_deps, sub_dep)
 			}
 		}
 		// Allow relative import paths within this repo.
@@ -604,31 +696,36 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 	}
 
 	used_rewrites := make(map[string]bool)
-	b._rewrite_imports(url, repo_dir, &sub_dep_map, &used_rewrites)
+	deps := b._rewrite_imports(url, repo_dir, &sub_dep_map, &used_rewrites)
+	new_deps = append(new_deps, deps...)
 	msg := fmt.Sprintf("rewritten by begot for %s", b.code_root)
 	cc(repo_dir, "git", "commit", "--allow-empty", "-a", "-q", "-m", msg)
 
 	// Add only the self-deps that were used, to reduce clutter.
 	for _, self_dep := range self_deps {
 		if used_rewrites[self_dep.name] {
-			b.deps = append(b.deps, self_dep)
+			new_deps = append(new_deps, self_dep)
 		}
 	}
+
+	return
 }
 
-func (b *Builder) _rewrite_imports(src_url, repo_dir string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
+func (b *Builder) _rewrite_imports(src_url, repo_dir string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) (new_deps []Dep) {
 	filepath.Walk(repo_dir, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if strings.HasSuffix(path, ".go") {
-			b._rewrite_file(src_url, path, sub_dep_map, used_rewrites)
+			deps := b._rewrite_file(src_url, path, sub_dep_map, used_rewrites)
+			new_deps = append(new_deps, deps...)
 		}
 		return nil
 	})
+	return
 }
 
-func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
+func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) (new_deps []Dep) {
 	bts, err := ioutil.ReadFile(path)
 	if err != nil {
 		panic(err)
@@ -648,7 +745,8 @@ func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]st
 		start := fs.Position(imp.Path.Pos()).Offset
 		end := fs.Position(imp.Path.End()).Offset
 		orig_import := string(bts[start+1 : end-1])
-		rewritten := b._rewrite_import(src_url, orig_import, sub_dep_map, used_rewrites)
+		rewritten, deps := b._rewrite_import(src_url, orig_import, sub_dep_map, used_rewrites)
+		new_deps = append(new_deps, deps...)
 		if orig_import != rewritten {
 			out.Write(bts[pos : start+1])
 			out.WriteString(rewritten)
@@ -660,39 +758,42 @@ func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]st
 	if err := ioutil.WriteFile(path, out.Bytes(), 0666); err != nil {
 		panic(err)
 	}
+	return
 }
 
-func (b *Builder) _rewrite_import(src_url, imp string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) string {
+func (b *Builder) _rewrite_import(src_url, imp string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) (new_imp string, new_deps []Dep) {
+	new_imp = imp
 	if rewrite, ok := (*sub_dep_map)[imp]; ok {
-		imp = rewrite
+		new_imp = rewrite
 		(*used_rewrites)[rewrite] = true
 	} else {
 		parts := strings.Split(imp, "/")
 		if _, ok := KNOWN_GIT_SERVERS[parts[0]]; ok {
-			imp = b._lookup_dep_name(src_url, imp)
+			new_imp, new_deps = b._lookup_dep_name(src_url, imp)
 		}
 	}
-	return imp
+	return
 }
 
-func (b *Builder) _lookup_dep_name(src_url, imp string) string {
+func (b *Builder) _lookup_dep_name(src_url, imp string) (name string, new_deps []Dep) {
+	// TODO: It's kind of gross to look through b.deps here. But b.deps is
+	// read-only while we're processing deps, so it's ok.
 	for _, dep := range b.deps {
 		if contains_str(dep.Aliases, imp) {
+			name = dep.name
 			b._record_repo_dep(src_url, dep.Git_url)
-			return dep.name
+			return
 		}
 	}
 
 	// Each dep turns into a symlink at build time. Packages can be nested, so we
 	// might depend on 'a' and 'a/b'. If we create a symlink for 'a', we can't
 	// also create 'a/b'. So rename it to 'a_b'.
-	name := IMPLICIT_PREFIX + replace_non_identifier_chars(imp)
-
+	name = IMPLICIT_PREFIX + replace_non_identifier_chars(imp)
 	dep := b.bf.parse_dep(name, imp)
-	b.deps = append(b.deps, dep)
-
+	new_deps = []Dep{dep}
 	b._record_repo_dep(src_url, dep.Git_url)
-	return name
+	return
 }
 
 func (b *Builder) _lookup_dep_by_git_url_and_path(git_url string, subpath string) *Dep {
@@ -706,14 +807,22 @@ func (b *Builder) _lookup_dep_by_git_url_and_path(git_url string, subpath string
 
 func (b *Builder) tag_repos() {
 	// Run this after setup_repos.
+	var wg sync.WaitGroup
 	for url, ref := range b._all_repos() {
-		out := co(b._repo_dir(url), "git", "tag", "--force", b._tag_hash(ref))
-		for _, line := range strings.SplitAfter(out, "\n") {
-			if !strings.HasPrefix(line, "Updated tag ") {
-				fmt.Print(line)
+		wg.Add(1)
+		go func(url, ref string) {
+			repo_dir := b._repo_dir(url)
+
+			out := co(repo_dir, "git", "tag", "--force", b._tag_hash(ref))
+			for _, line := range strings.SplitAfter(out, "\n") {
+				if !strings.HasPrefix(line, "Updated tag ") {
+					fmt.Print(line)
+				}
 			}
-		}
+			wg.Done()
+		}(url, ref)
 	}
+	wg.Wait()
 }
 
 func (b *Builder) _tag_hash(ref string) string {
@@ -835,19 +944,28 @@ func (b *Builder) run(args []string) {
 }
 
 func (b *Builder) _reset_to_tags() {
-	defer func() {
-		if recover() != nil {
-			panic(fmt.Errorf("Begotten.lock refers to a missing local commit. " +
-				"Please run 'begot fetch' first."))
-		}
-	}()
+	var wg sync.WaitGroup
 	for url, ref := range b._all_repos() {
-		wd := b._repo_dir(url)
-		if fi, err := os.Stat(wd); err != nil || !fi.Mode().IsDir() {
-			panic("not directory")
-		}
-		cc(wd, "git", "reset", "-q", "--hard", "tags/"+b._tag_hash(ref))
+		wg.Add(1)
+		go func(url, ref string) {
+			defer func() {
+				if recover() != nil {
+					fmt.Fprintf(os.Stderr, "Begotten.lock refers to a missing local commit. "+
+						"Please run 'begot fetch' first.")
+					os.Exit(1)
+				}
+			}()
+
+			repo_dir := b._repo_dir(url)
+
+			if fi, err := os.Stat(repo_dir); err != nil || !fi.Mode().IsDir() {
+				panic("not directory")
+			}
+			cc(repo_dir, "git", "reset", "-q", "--hard", "tags/"+b._tag_hash(ref))
+			wg.Done()
+		}(url, ref)
 	}
+	wg.Wait()
 }
 
 func (b *Builder) clean() {
@@ -904,7 +1022,7 @@ func main() {
 
 	defer func() {
 		if err := recover(); err != nil {
-			fmt.Printf("Error: %s\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %s\n", err)
 			os.Exit(1)
 		}
 	}()
