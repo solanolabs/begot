@@ -299,8 +299,7 @@ type Builder struct {
 	deps      []Dep
 	repo_deps map[string][]string
 
-	processing_repo string
-	cached_lf_hash  string
+	cached_lf_hash string
 }
 
 func BuilderNew(env *Env, code_root string, use_lockfile bool) (b *Builder) {
@@ -451,18 +450,11 @@ func (b *Builder) save_lockfile() *Builder {
 	return b
 }
 
-func (b *Builder) _add_implicit_dep(name string, v interface{}) (dep Dep) {
-	dep = b.bf.parse_dep(name, v)
-	//FIXME append: b.deps = b.deps.append(dep)
-	b.deps = append(b.deps, dep)
-	return
-}
-
-func (b *Builder) _record_repo_dep(git_url string) {
-	if b.processing_repo != git_url {
-		lst := b.repo_deps[b.processing_repo]
-		if !contains_str(lst, git_url) {
-			b.repo_deps[b.processing_repo] = append(lst, git_url)
+func (b *Builder) _record_repo_dep(src_url, dep_url string) {
+	if src_url != dep_url {
+		lst := b.repo_deps[src_url]
+		if !contains_str(lst, dep_url) {
+			b.repo_deps[src_url] = append(lst, dep_url)
 		}
 	}
 }
@@ -500,20 +492,11 @@ func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (re
 }
 
 func (b *Builder) _setup_repo(url, resolved_ref string) {
-	b.processing_repo = url
 	hsh := sha1str(url)[:8]
 	repo_dir := b._repo_dir(url)
 
 	fmt.Printf("Fixing imports in %s\n", url)
-	// TODO: can this ever fail (if we made it here)? if so, need to fall back
-	// to fetch first.
 	cc(repo_dir, "git", "reset", "-q", "--hard", resolved_ref)
-	//try:
-	//  cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
-	//except subprocess.CalledProcessError:
-	//  print "Missing local ref %r, updating" % resolved_ref
-	//  cc(['git', 'fetch', '-q'], cwd=repo_dir)
-	//  cc(['git', 'reset', '-q', '--hard', resolved_ref], cwd=repo_dir)
 
 	// Match up sub-deps to our deps.
 	sub_dep_map := make(map[string]string)
@@ -523,7 +506,7 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 		sub_bg := BegottenFileNew(sub_bg_path)
 		// Add implicit and explicit external dependencies.
 		for _, sub_dep := range sub_bg.deps() {
-			b._record_repo_dep(sub_dep.Git_url)
+			b._record_repo_dep(url, sub_dep.Git_url)
 			our_dep := b._lookup_dep_by_git_url_and_path(sub_dep.Git_url, sub_dep.Subpath)
 			if our_dep != nil {
 				if sub_dep.Ref != our_dep.Ref {
@@ -571,7 +554,7 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 	}
 
 	used_rewrites := make(map[string]bool)
-	b._rewrite_imports(repo_dir, &sub_dep_map, &used_rewrites)
+	b._rewrite_imports(url, repo_dir, &sub_dep_map, &used_rewrites)
 	msg := fmt.Sprintf("rewritten by begot for %s", b.code_root)
 	cc(repo_dir, "git", "commit", "--allow-empty", "-a", "-q", "-m", msg)
 
@@ -584,19 +567,19 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 	}
 }
 
-func (b *Builder) _rewrite_imports(repo_dir string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
+func (b *Builder) _rewrite_imports(src_url, repo_dir string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
 	filepath.Walk(repo_dir, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if strings.HasSuffix(path, ".go") {
-			b._rewrite_file(path, sub_dep_map, used_rewrites)
+			b._rewrite_file(src_url, path, sub_dep_map, used_rewrites)
 		}
 		return nil
 	})
 }
 
-func (b *Builder) _rewrite_file(path string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
+func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) {
 	bts, err := ioutil.ReadFile(path)
 	if err != nil {
 		panic(err)
@@ -616,7 +599,7 @@ func (b *Builder) _rewrite_file(path string, sub_dep_map *map[string]string, use
 		start := fs.Position(imp.Path.Pos()).Offset
 		end := fs.Position(imp.Path.End()).Offset
 		orig_import := string(bts[start+1 : end-1])
-		rewritten := b._rewrite_import(orig_import, sub_dep_map, used_rewrites)
+		rewritten := b._rewrite_import(src_url, orig_import, sub_dep_map, used_rewrites)
 		if orig_import != rewritten {
 			out.Write(bts[pos : start+1])
 			out.WriteString(rewritten)
@@ -630,23 +613,23 @@ func (b *Builder) _rewrite_file(path string, sub_dep_map *map[string]string, use
 	}
 }
 
-func (b *Builder) _rewrite_import(imp string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) string {
+func (b *Builder) _rewrite_import(src_url, imp string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) string {
 	if rewrite, ok := (*sub_dep_map)[imp]; ok {
 		imp = rewrite
 		(*used_rewrites)[rewrite] = true
 	} else {
 		parts := strings.Split(imp, "/")
 		if _, ok := KNOWN_GIT_SERVERS[parts[0]]; ok {
-			imp = b._lookup_dep_name(imp)
+			imp = b._lookup_dep_name(src_url, imp)
 		}
 	}
 	return imp
 }
 
-func (b *Builder) _lookup_dep_name(imp string) string {
+func (b *Builder) _lookup_dep_name(src_url, imp string) string {
 	for _, dep := range b.deps {
 		if contains_str(dep.Aliases, imp) {
-			b._record_repo_dep(dep.Git_url)
+			b._record_repo_dep(src_url, dep.Git_url)
 			return dep.name
 		}
 	}
@@ -655,8 +638,11 @@ func (b *Builder) _lookup_dep_name(imp string) string {
 	// might depend on 'a' and 'a/b'. If we create a symlink for 'a', we can't
 	// also create 'a/b'. So rename it to 'a_b'.
 	name := IMPLICIT_PREFIX + replace_non_identifier_chars(imp)
-	dep := b._add_implicit_dep(name, imp)
-	b._record_repo_dep(dep.Git_url)
+
+	dep := b.bf.parse_dep(name, imp)
+	b.deps = append(b.deps, dep)
+
+	b._record_repo_dep(src_url, dep.Git_url)
 	return name
 }
 
