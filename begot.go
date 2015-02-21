@@ -28,10 +28,6 @@ const (
 	EMPTY_DEP       = "_begot_empty_dep"
 	IMPLICIT_PREFIX = "_begot_implicit"
 
-	// This is an identifier for the version of begot. It gets written into
-	// Begotten.lock.
-	//CODE_VERSION = 'begot-1.0-' + hashlib.sha1(open(__file__).read()).hexdigest()[:8]
-	CODE_VERSION = "FIXME"
 	// This should change if the format of Begotten.lock changes in an incompatible
 	// way. (But prefer changing it in compatible ways and not incrementing this.)
 	FILE_VERSION = 1
@@ -573,7 +569,6 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 				transitive_name := fmt.Sprintf("_begot_transitive_%s/%s", hsh, sub_dep.name)
 				sub_dep_map[sub_dep.name] = transitive_name
 				sub_dep.name = transitive_name
-				// FIXME append: b.deps.append(sub_dep)
 				b.deps = append(b.deps, sub_dep)
 			}
 		}
@@ -613,7 +608,6 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 	// Add only the self-deps that were used, to reduce clutter.
 	for _, self_dep := range self_deps {
 		if used_rewrites[self_dep.name] {
-			//FIXME append: b.deps.append(self_dep)
 			b.deps = append(b.deps, self_dep)
 		}
 	}
