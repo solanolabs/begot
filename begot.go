@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -128,20 +129,20 @@ func yaml_copy(in interface{}, out interface{}) {
 
 type Dep struct {
 	name        string
-	Import_path string
-	Git_url     string
-	Subpath     string
-	Ref         string
 	Aliases     []string
+	Git_url     string
+	Import_path string `yaml:",omitempty"`
+	Ref         string
+	Subpath     string
 }
 
 // A Begotten or Begotten.lock file contains exactly one of these in YAML format.
 type BegottenFileStruct struct {
+	Deps map[string]interface{} // either string or Dep
 	Meta struct {
 		File_version int
 		Generated_by string
 	}
-	Deps         map[string]interface{} // either string or Dep
 	Repo_aliases map[string]interface{} // either string or subset of Dep {git_url, ref}
 	Repo_deps    map[string][]string
 }
@@ -165,10 +166,55 @@ func BegottenFileNew(fn string) (bf *BegottenFile) {
 	return
 }
 
+type SortedStringMap yaml.MapSlice
+
+func (sm SortedStringMap) Len() int {
+	return len(sm)
+}
+func (sm SortedStringMap) Less(i, j int) bool {
+	return sm[i].Key.(string) < sm[j].Key.(string)
+}
+func (sm SortedStringMap) Swap(i, j int) {
+	sm[i], sm[j] = sm[j], sm[i]
+}
+
 func (bf *BegottenFile) save(fn string) {
-	bf.data.Meta.File_version = FILE_VERSION
-	bf.data.Meta.Generated_by = CODE_VERSION
-	if data, err := yaml.Marshal(bf.data); err != nil {
+	// We have to sort everything so the output is deterministic. go-yaml
+	// doesn't write maps in sorted order, so we have to convert them to
+	// yaml.MapSlices and sort those.
+	var out struct {
+		Deps SortedStringMap
+		Meta struct {
+			File_version int
+			Generated_by string
+		}
+		Repo_aliases SortedStringMap
+		Repo_deps    SortedStringMap
+	}
+
+	out.Meta.File_version = FILE_VERSION
+	out.Meta.Generated_by = CODE_VERSION
+
+	for k, v := range bf.data.Deps {
+		dep := v.(Dep)
+		dep.Import_path = ""
+		sort.StringSlice(dep.Aliases).Sort()
+		out.Deps = append(out.Deps, yaml.MapItem{k, dep})
+	}
+	sort.Sort(out.Deps)
+
+	for k, v := range bf.data.Repo_aliases {
+		out.Repo_aliases = append(out.Repo_aliases, yaml.MapItem{k, v})
+	}
+	sort.Sort(out.Repo_aliases)
+
+	for k, v := range bf.data.Repo_deps {
+		sort.StringSlice(v).Sort()
+		out.Repo_deps = append(out.Repo_deps, yaml.MapItem{k, v})
+	}
+	sort.Sort(out.Repo_deps)
+
+	if data, err := yaml.Marshal(out); err != nil {
 		panic(err)
 	} else if err := ioutil.WriteFile(fn, data, 0666); err != nil {
 		panic(err)
