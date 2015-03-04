@@ -28,9 +28,8 @@ const (
 
 	DEFAULT_BRANCH = "master"
 
-	EMPTY_DEP       = "_begot_empty_dep"
-	IMPLICIT_PREFIX = "_begot_implicit/"
-	FLOAT           = "_begot_float"
+	EMPTY_DEP = "_begot_empty_dep"
+	FLOAT     = "_begot_float"
 
 	// This should change if the format of Begotten.lock changes in an incompatible
 	// way. (But prefer changing it in compatible ways and not incrementing this.)
@@ -132,6 +131,7 @@ type Dep struct {
 	Import_path string `yaml:",omitempty"`
 	Ref         string
 	Subpath     string
+	Source      []string
 }
 
 // A Begotten or Begotten.lock file contains exactly one of these in YAML format.
@@ -310,6 +310,10 @@ func (bf *BegottenFile) set_repo_deps(repo_deps map[string][]string) {
 	bf.data.Repo_deps = repo_deps
 }
 
+func (dep *Dep) set_implicit_name() {
+	dep.name = "_begot_" + sha1str(dep.Git_url+"/"+dep.Subpath)
+}
+
 type Env struct {
 	Home             string
 	BegotCache       string
@@ -369,6 +373,11 @@ func BuilderNew(env *Env, code_root string, use_lockfile bool) (b *Builder) {
 	}
 	b.bf = BegottenFileNew(fn)
 	b.deps = b.bf.deps()
+	if !use_lockfile {
+		for i := range b.deps {
+			b.deps[i].Source = []string{"explicit"}
+		}
+	}
 	b.repo_deps = b.bf.repo_deps()
 
 	b.repo_locks = make(map[string]*sync.Mutex)
@@ -446,7 +455,7 @@ func (b *Builder) get_locked_refs_for_update(limits []string) (out map[string]st
 func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	var repo_versions_lock, new_deps_lock, to_process_lock sync.Mutex
 	repo_versions := make(map[string]string)
-	var new_deps, to_process []Dep
+	var new_deps, to_process []*Dep
 
 	var should_fetch func(string) bool
 	if fetch {
@@ -468,16 +477,14 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 
 	var wg sync.WaitGroup
 
-	var process_dep func(Dep)
-	process_dep = func(dep Dep) {
+	var process_dep func(*Dep)
+	process_dep = func(dep *Dep) {
 		defer func() {
 			if err := recover(); err != nil {
 				fmt.Printf("Error: %s\n", err)
 				os.Exit(1)
 			}
 		}()
-
-		out := dep
 
 		want := locked_refs[dep.Git_url]
 		if want == "" {
@@ -501,9 +508,10 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 				repo_versions[dep.Git_url] = want
 				repo_versions_lock.Unlock()
 
-				for _, new_dep := range b._setup_repo(dep.Git_url, want) {
+				repo_deps := b._setup_repo(dep.Git_url, want)
+				for i := range repo_deps {
 					wg.Add(1)
-					go process_dep(new_dep)
+					go process_dep(&repo_deps[i])
 				}
 			} else {
 				repo_versions_lock.Unlock()
@@ -514,17 +522,19 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 				return
 			}
 		}
-		out.Ref = want
+		dep.Ref = want
 
 		new_deps_lock.Lock()
-		new_deps = append(new_deps, out)
+		new_deps = append(new_deps, dep)
 		new_deps_lock.Unlock()
 		wg.Done()
 	}
 
 	// Throw in all the deps from the file to get started.
-	to_process = make([]Dep, len(b.deps))
-	copy(to_process, b.deps)
+	to_process = make([]*Dep, len(b.deps))
+	for i := range b.deps {
+		to_process[i] = &b.deps[i]
+	}
 
 	// Process one round at a time.
 	last_round := -1
@@ -534,10 +544,10 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 			break
 		} else if len(to_process) == last_round {
 			// No progress, everything left must be floating. Set to default.
-			for i, dep := range to_process {
+			for _, dep := range to_process {
 				fmt.Printf("Assuming %q for implicit dep of %s on %s\n",
 					DEFAULT_BRANCH, dep.name, dep.Git_url)
-				to_process[i].Ref = DEFAULT_BRANCH
+				dep.Ref = DEFAULT_BRANCH
 			}
 		}
 		for _, dep := range to_process {
@@ -545,13 +555,16 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 			go process_dep(dep)
 		}
 		last_round = len(to_process)
-		to_process = to_process[0:0]
+		to_process = nil
 		to_process_lock.Unlock()
 
 		wg.Wait()
 	}
 
-	b.deps = new_deps
+	b.deps = make([]Dep, len(new_deps))
+	for i := range new_deps {
+		b.deps[i] = *new_deps[i]
+	}
 
 	return b
 }
@@ -633,7 +646,6 @@ func (b *Builder) _resolve_ref(url, ref string, should_fetch func(string) bool) 
 }
 
 func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
-	hsh := sha1str(url)[:8]
 	repo_dir := b._repo_dir(url)
 
 	repo_lock := b._repo_lock(repo_dir)
@@ -656,8 +668,14 @@ func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
 		sub_bg := BegottenFileNew(sub_bg_path)
 		// Add implicit and explicit external dependencies.
 		for _, sub_dep := range sub_bg.deps() {
+			for i, s := range sub_dep.Source {
+				sub_dep.Source[i] = url + " => " + s
+			}
+
 			b._record_repo_dep(url, sub_dep.Git_url)
+
 			our_dep := b._lookup_dep_by_git_url_and_path(sub_dep.Git_url, sub_dep.Subpath)
+
 			if our_dep != nil {
 				if sub_dep.Ref != our_dep.Ref {
 					real_ref := b._resolve_ref(our_dep.Git_url, our_dep.Ref, nil)
@@ -666,12 +684,10 @@ func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
 				}
 				sub_dep_map[sub_dep.name] = our_dep.name
 			} else {
-				// Include a hash of this repo identifier so that if two repos use the
-				// same dep name to refer to two different things, they don't conflict
-				// when we flatten deps.
-				transitive_name := fmt.Sprintf("_begot_transitive_%s/%s", hsh, sub_dep.name)
-				sub_dep_map[sub_dep.name] = transitive_name
-				sub_dep.name = transitive_name
+				orig_name := sub_dep.name
+				sub_dep.set_implicit_name()
+				//sub_dep.Source = append(sub_dep.Source, fmt.Sprintf("transitive dep of %s in %s", orig_name, url))
+				sub_dep_map[orig_name] = sub_dep.name
 				new_deps = append(new_deps, sub_dep)
 			}
 		}
@@ -682,7 +698,7 @@ func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
 				return err
 			} else if fi.IsDir() && basename[0] == '.' {
 				return filepath.SkipDir
-			} else if path == repo_dir {
+			} else if !fi.IsDir() || path == repo_dir {
 				return nil
 			}
 			relpath := path[len(repo_dir)+1:]
@@ -690,11 +706,11 @@ func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
 			if our_dep != nil {
 				sub_dep_map[relpath] = our_dep.name
 			} else {
-				// See comment on _lookup_dep_name for rationale.
-				self_name := fmt.Sprintf("_begot_self_%s/%s", hsh, replace_non_identifier_chars(relpath))
-				sub_dep_map[relpath] = self_name
-				self_deps = append(self_deps, Dep{
-					name: self_name, Git_url: url, Subpath: relpath, Ref: resolved_ref})
+				dep := Dep{name: "", Git_url: url, Subpath: relpath, Ref: resolved_ref,
+					Source: []string{fmt.Sprintf("self dep for %s in %s", relpath, url)}}
+				dep.set_implicit_name()
+				sub_dep_map[relpath] = dep.name
+				self_deps = append(self_deps, dep)
 			}
 			return nil
 		})
@@ -784,6 +800,7 @@ func (b *Builder) _rewrite_import(src_url, imp string, sub_dep_map *map[string]s
 }
 
 func (b *Builder) _lookup_dep_name(src_url, imp string) (name string, new_deps []Dep) {
+	// Check if this matches one of our explicit deps.
 	// TODO: It's kind of gross to look through b.deps here. But b.deps is
 	// read-only while we're processing deps, so it's ok.
 	for _, dep := range b.deps {
@@ -794,17 +811,18 @@ func (b *Builder) _lookup_dep_name(src_url, imp string) (name string, new_deps [
 		}
 	}
 
-	// Each dep turns into a symlink at build time. Packages can be nested, so we
-	// might depend on 'a' and 'a/b'. If we create a symlink for 'a', we can't
-	// also create 'a/b'. So rename it to 'a_b'.
-	name = IMPLICIT_PREFIX + replace_non_identifier_chars(imp)
-	dep := b.bf.parse_dep(name, imp, FLOAT)
+	// Otherwise it's a new implicit dep.
+	dep := b.bf.parse_dep("", imp, FLOAT)
+	dep.set_implicit_name()
+	dep.Source = []string{fmt.Sprintf("%s -> %s", src_url, imp)}
+	name = dep.name
 	new_deps = []Dep{dep}
 	b._record_repo_dep(src_url, dep.Git_url)
 	return
 }
 
 func (b *Builder) _lookup_dep_by_git_url_and_path(git_url string, subpath string) *Dep {
+	// TODO: same comment as above
 	for _, dep := range b.deps {
 		if dep.Git_url == git_url && dep.Subpath == subpath {
 			return &dep
