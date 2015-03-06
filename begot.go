@@ -53,18 +53,16 @@ func Command(cwd string, name string, args ...string) (cmd *exec.Cmd) {
 }
 
 func cc(cwd string, name string, args ...string) {
-	//fmt.Println("+", "in", filepath.Base(cwd), ":", name, args)
 	cmd := Command(cwd, name, args...)
 	if err := cmd.Run(); err != nil {
-		panic(err)
+		panic(fmt.Errorf("command '%s %s' in %s: %s", name, strings.Join(args, " "), cwd, err))
 	}
 }
 
 func co(cwd string, name string, args ...string) string {
-	//fmt.Println("+", "in", filepath.Base(cwd), ":", name, args)
 	cmd := Command(cwd, name, args...)
 	if outb, err := cmd.Output(); err != nil {
-		panic(err)
+		panic(fmt.Errorf("command '%s %s' in %s: %s", name, strings.Join(args, " "), cwd, err))
 	} else {
 		return string(outb)
 	}
@@ -519,7 +517,7 @@ func (b *Builder) _resolve_ref(url, ref string, fetched_set map[string]bool) (re
 	} else if fetched_set != nil {
 		if !fetched_set[url] {
 			fmt.Printf("Updating %s\n", url)
-			cc(repo_dir, "git", "fetch")
+			cc(repo_dir, "git", "fetch", "-q")
 			fetched_set[url] = true
 		}
 	}
@@ -544,7 +542,12 @@ func (b *Builder) _setup_repo(url, resolved_ref string) {
 	repo_dir := b._repo_dir(url)
 
 	fmt.Printf("Fixing imports in %s\n", url)
-	cc(repo_dir, "git", "reset", "-q", "--hard", resolved_ref)
+	cmd := Command(repo_dir, "git", "reset", "-q", "--hard", resolved_ref)
+	if err := cmd.Run(); err != nil {
+		fmt.Printf("Updating %s\n", url)
+		cc(repo_dir, "git", "fetch", "-q")
+		cc(repo_dir, "git", "reset", "-q", "--hard", resolved_ref)
+	}
 
 	// Match up sub-deps to our deps.
 	sub_dep_map := make(map[string]string)

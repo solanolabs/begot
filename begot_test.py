@@ -930,6 +930,30 @@ def test_fetch_before_build():
   begot_err('build', expect='missing local commit')
 
 
+def test_fetch_can_fetch():
+  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_begot_workdir(
+      {'tp/dep': 'begot.test/user/repo'},
+      {'app/main.go': MAIN_GO})
+
+  begot('update')
+
+  # snapshot cache
+  os.rename(cachedir, cachedir+'.tmp')
+
+  with chdir(repo_path('user/repo')):
+    open('number.go', 'a').write("\n")
+    git('commit', '-q', '-a', '-m', 'foo')
+
+  begot('update')
+
+  # restore snapshot
+  clear_cache()
+  os.rename(cachedir+'.tmp', cachedir)
+
+  begot('fetch')
+
+
 def test_no_rebuild():
   make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
   make_begot_workdir(
