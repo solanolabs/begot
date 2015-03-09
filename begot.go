@@ -740,7 +740,8 @@ func (b *Builder) run(args []string) {
 	cbin := filepath.Join(b.code_wk, "bin")
 	depsrc := filepath.Join(b.dep_wk, "src")
 	empty_dep := filepath.Join(depsrc, EMPTY_DEP)
-	os.MkdirAll(filepath.Join(cbin, empty_dep), 0777)
+	os.MkdirAll(cbin, 0777)
+	os.MkdirAll(empty_dep, 0777)
 	if _, err := ln_sf(cbin, filepath.Join(b.code_root, "bin")); err != nil {
 		panic(fmt.Errorf("It looks like you have an existing 'bin' directory. " +
 			"Please remove it before using begot."))
