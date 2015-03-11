@@ -90,6 +90,10 @@ func sha1bts(in []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func implicit_name(git_url, subpath string) string {
+	return "_begot_" + sha1str(git_url+"/"+subpath)
+}
+
 func realpath(path string) (out string) {
 	if abs, err := filepath.Abs(path); err != nil {
 		panic(err)
@@ -124,25 +128,37 @@ func yaml_copy(in interface{}, out interface{}) {
 	}
 }
 
-type Dep struct {
+type RequestedDep struct {
 	name        string
-	Aliases     []string
 	Git_url     string
-	Import_path string `yaml:",omitempty"`
+	Import_path string
 	Ref         string
 	Subpath     string
-	Source      []string
+	Source      []string // TODO: hmmm...
+}
+
+// TODO: factor Ref out of here into separate thing
+type ResolvedDep struct {
+	name      string
+	Git_url   string
+	Commit_id string
+	Subpath   string
+	Source    []string
 }
 
 // A Begotten or Begotten.lock file contains exactly one of these in YAML format.
 type BegottenFileStruct struct {
-	Deps map[string]interface{} // either string or Dep
+	// in Begotten:
+	Deps         map[string]interface{} // either string or RequestedDep
+	Repo_aliases map[string]interface{} // either string or subset of RequestedDep {git_url, ref}
+
+	// in Begotten.lock:
 	Meta struct {
 		File_version int
 		Generated_by string
 	}
-	Repo_aliases map[string]interface{} // either string or subset of Dep {git_url, ref}
-	Repo_deps    map[string][]string
+	Repo_deps     map[string][]string
+	Resolved_deps map[string]ResolvedDep
 }
 
 type BegottenFile struct {
@@ -176,41 +192,32 @@ func (sm SortedStringMap) Swap(i, j int) {
 	sm[i], sm[j] = sm[j], sm[i]
 }
 
-func (bf *BegottenFile) save(fn string) {
+func (bf *BegottenFile) save(fn string, deps []ResolvedDep, repo_deps map[string][]string) {
 	// We have to sort everything so the output is deterministic. go-yaml
 	// doesn't write maps in sorted order, so we have to convert them to
 	// yaml.MapSlices and sort those.
 	var out struct {
-		Deps SortedStringMap
 		Meta struct {
 			File_version int
 			Generated_by string
 		}
-		Repo_aliases SortedStringMap
-		Repo_deps    SortedStringMap
+		Repo_deps     SortedStringMap
+		Resolved_deps SortedStringMap
 	}
 
 	out.Meta.File_version = FILE_VERSION
 	out.Meta.Generated_by = CODE_VERSION
 
-	for k, v := range bf.data.Deps {
-		dep := v.(Dep)
-		dep.Import_path = ""
-		sort.StringSlice(dep.Aliases).Sort()
-		out.Deps = append(out.Deps, yaml.MapItem{k, dep})
-	}
-	sort.Sort(out.Deps)
-
-	for k, v := range bf.data.Repo_aliases {
-		out.Repo_aliases = append(out.Repo_aliases, yaml.MapItem{k, v})
-	}
-	sort.Sort(out.Repo_aliases)
-
-	for k, v := range bf.data.Repo_deps {
+	for k, v := range repo_deps {
 		sort.StringSlice(v).Sort()
 		out.Repo_deps = append(out.Repo_deps, yaml.MapItem{k, v})
 	}
 	sort.Sort(out.Repo_deps)
+
+	for _, dep := range deps {
+		out.Resolved_deps = append(out.Resolved_deps, yaml.MapItem{dep.name, dep})
+	}
+	sort.Sort(out.Resolved_deps)
 
 	if data, err := yaml.Marshal(out); err != nil {
 		panic(err)
@@ -229,7 +236,7 @@ func (bf *BegottenFile) default_git_url_from_repo_path(repo_path string) string 
 	return "https://" + repo_path
 }
 
-func (bf *BegottenFile) parse_dep(name string, v interface{}, default_branch, default_source string) (dep Dep) {
+func (bf *BegottenFile) parse_dep(name string, v interface{}, default_branch, default_source string) (dep RequestedDep) {
 	dep.name = name
 
 	if _, ok := v.(string); ok {
@@ -251,11 +258,10 @@ func (bf *BegottenFile) parse_dep(name string, v interface{}, default_branch, de
 			repo_path := strings.Join(parts[:repo_parts+1], "/")
 			dep.Git_url = bf.default_git_url_from_repo_path(repo_path)
 			dep.Subpath = strings.Join(parts[repo_parts+1:], "/")
-			dep.Aliases = append(dep.Aliases, dep.Import_path)
 
 			// Redirect through repo aliases:
 			if alias, ok := bf.data.Repo_aliases[repo_path]; ok {
-				var aliasdep Dep // only allow git_url and ref
+				var aliasdep RequestedDep // only allow git_url and ref
 				if aliasstr, ok := alias.(string); ok {
 					aliasstr = bf.default_git_url_from_repo_path(aliasstr)
 					alias = yaml.MapSlice{yaml.MapItem{"git_url", aliasstr}}
@@ -286,8 +292,8 @@ func (bf *BegottenFile) parse_dep(name string, v interface{}, default_branch, de
 	return
 }
 
-func (bf *BegottenFile) deps() (out []Dep) {
-	out = make([]Dep, len(bf.data.Deps))
+func (bf *BegottenFile) requested_deps() (out []RequestedDep) {
+	out = make([]RequestedDep, len(bf.data.Deps))
 	i := 0
 	for name, v := range bf.data.Deps {
 		out[i] = bf.parse_dep(name, v, DEFAULT_BRANCH, "explicit")
@@ -296,11 +302,15 @@ func (bf *BegottenFile) deps() (out []Dep) {
 	return
 }
 
-func (bf *BegottenFile) set_deps(deps []Dep) {
-	bf.data.Deps = make(map[string]interface{})
-	for _, dep := range deps {
-		bf.data.Deps[dep.name] = dep
+func (bf *BegottenFile) resolved_deps() (out []ResolvedDep) {
+	out = make([]ResolvedDep, len(bf.data.Resolved_deps))
+	i := 0
+	for name, v := range bf.data.Resolved_deps {
+		v.name = name
+		out[i] = v
+		i++
 	}
+	return
 }
 
 func (bf *BegottenFile) repo_deps() map[string][]string {
@@ -308,14 +318,6 @@ func (bf *BegottenFile) repo_deps() map[string][]string {
 		bf.data.Repo_deps = make(map[string][]string)
 	}
 	return bf.data.Repo_deps
-}
-
-func (bf *BegottenFile) set_repo_deps(repo_deps map[string][]string) {
-	bf.data.Repo_deps = repo_deps
-}
-
-func (dep *Dep) set_implicit_name() {
-	dep.name = "_begot_" + sha1str(dep.Git_url+"/"+dep.Subpath)
 }
 
 type Env struct {
@@ -350,7 +352,8 @@ type Builder struct {
 
 	bf *BegottenFile
 
-	out_deps []Dep
+	requested_deps []RequestedDep
+	resolved_deps  []ResolvedDep
 
 	repo_deps_lock sync.Mutex
 	repo_deps      map[string][]string
@@ -376,15 +379,15 @@ func BuilderNew(env *Env, code_root string, use_lockfile bool) (b *Builder) {
 		fn = filepath.Join(b.code_root, BEGOTTEN)
 	}
 	b.bf = BegottenFileNew(fn)
-	b.repo_deps = b.bf.repo_deps()
+	b.repo_deps = make(map[string][]string)
 
 	return
 }
 
-func (b *Builder) _all_repos(deps []Dep) (out map[string]string) {
+func (b *Builder) _all_repos(deps []ResolvedDep) (out map[string]string) {
 	out = make(map[string]string)
 	for _, dep := range deps {
-		out[dep.Git_url] = dep.Ref
+		out[dep.Git_url] = dep.Commit_id
 	}
 	return
 }
@@ -402,7 +405,7 @@ func (b *Builder) get_locked_refs_for_update(limits []string) (out map[string]st
 	}()
 	bf_lock := BegottenFileNew(filepath.Join(b.code_root, BEGOTTEN_LOCK))
 
-	lock_deps := bf_lock.deps()
+	lock_deps := bf_lock.resolved_deps()
 	lock_repo_deps := bf_lock.repo_deps()
 
 	match := func(name string) bool {
@@ -442,14 +445,21 @@ func (b *Builder) get_locked_refs_for_update(limits []string) (out map[string]st
 
 	for _, dep := range lock_deps {
 		if !repos_to_update[dep.Git_url] {
-			out[dep.Git_url] = dep.Ref
+			out[dep.Git_url] = dep.Commit_id
 		}
 	}
 	return
 }
 
 // Each call to _process is a goroutine and has exclusive responsibility for one repo.
-func (b *Builder) _process(url string, should_fetch bool, c chan Dep, in_chan, out_chan chan<- Dep, in_wg, out_wg *sync.WaitGroup) {
+func (b *Builder) _process(
+	url string,
+	should_fetch bool,
+	my_chan chan RequestedDep,
+	new_dep func(RequestedDep),
+	out_dep func(ResolvedDep),
+	in_wg *sync.WaitGroup) {
+
 	defer func() {
 		if err := recover(); err != nil {
 			fmt.Printf("Error: %s\n", err)
@@ -458,22 +468,22 @@ func (b *Builder) _process(url string, should_fetch bool, c chan Dep, in_chan, o
 	}()
 
 	// problem 1: we need a ref before we can setup and get deps of this repo.
-	// this sorta works.
+	// DONE.
 	// problem 2: the rewrite step needs to be able to look up a name from a
 	// url+path. we can hash so that they all end up at the same name, but that
 	// doesn't help to match up sub-deps to explicit deps, and we need to do
-	// that to avoid duplicating.
+	// that to avoid duplicating. DONE.
 	// problem 3: we need to postpone processing when we get a FLOAT.
 	// might be solved?
 	// problem 4: if we get all floats, we need to default to master and _then_
 	// process more deps. that strongly suggests a round structure...
 
-	out := make(map[string]Dep) // map from subpath to Dep
+	out := make(map[string]ResolvedDep) // map from subpath to ResolvedDep
 
-	locked, was_locked := locked_refs[url]
+	locked, was_locked := b.locked_refs[url]
 	var have string
 
-	for dep := range c {
+	for dep := range my_chan {
 		var want string
 		if was_locked {
 			want = locked
@@ -492,53 +502,66 @@ func (b *Builder) _process(url string, should_fetch bool, c chan Dep, in_chan, o
 		} else {
 			if want != FLOAT {
 				have = want
-				for _, dep := range b._setup_repo(url, have) {
-					in_chan <- dep
-				}
+				b._setup_repo(url, have, new_dep)
 			} else {
 				// Put back on the end of the queue.
 				// FIXME: really???
-				go func(d Dep) { c <- d }(dep)
+				go func(d RequestedDep) { my_chan <- d }(dep)
 				continue
 			}
 		}
-		dep.Ref = have
 
 		if outdep, ok := out[dep.Subpath]; ok {
 			outdep.Source = append(outdep.Source, dep.Source...)
 			out[dep.Subpath] = outdep
 		} else {
-			out[dep.Subpath] = dep
+			out[dep.Subpath] = ResolvedDep{
+				name:      dep.name,
+				Git_url:   url,
+				Commit_id: have,
+				Subpath:   dep.Subpath,
+				Source:    dep.Source,
+			}
 		}
 
 		in_wg.Done()
 	}
 
 	for _, dep := range out {
-		out_wg.Add(1)
-		out_chan <- dep
+		out_dep(dep)
 	}
 }
 
 func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	b.locked_refs = b.get_locked_refs_for_update(limits)
+	b.requested_deps = b.bf.requested_deps()
+	// After this point, b.locked_refs and b.requested_deps are constant, so
+	// other goroutines can read from them.
 
-	input := make(chan Dep)
-	output := make(chan Dep)
+	input := make(chan RequestedDep)
+	output := make(chan ResolvedDep)
 
 	var out_wg, in_wg sync.WaitGroup
 
+	new_dep := func(dep RequestedDep) {
+		in_wg.Add(1)
+		input <- dep
+	}
+	out_dep := func(dep ResolvedDep) {
+		out_wg.Add(1)
+		output <- dep
+	}
+
 	out_wg.Add(1)
 	go func() {
-		chans := make(map[string]chan Dep)
+		chans := make(map[string]chan RequestedDep)
 		for dep := range input {
-			in_wg.Add(1)
 			if c, ok := chans[dep.Git_url]; ok {
 				c <- dep
 			} else {
-				c = make(chan Dep)
+				c = make(chan RequestedDep)
 				chans[dep.Git_url] = c
-				go b._process(dep.Git_url, fetch, c, input, output, &in_wg, &out_wg)
+				go b._process(dep.Git_url, fetch, c, new_dep, out_dep, &in_wg)
 				c <- dep
 			}
 		}
@@ -550,13 +573,13 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 
 	go func() {
 		for dep := range output {
-			b.out_deps = append(b.out_deps, dep)
+			b.resolved_deps = append(b.resolved_deps, dep)
 			out_wg.Done()
 		}
 	}()
 
-	for _, dep := range b.bf.deps() {
-		input <- dep
+	for _, dep := range b.requested_deps {
+		new_dep(dep)
 	}
 	in_wg.Wait()
 	close(input)
@@ -569,11 +592,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 func (b *Builder) save_lockfile() *Builder {
 	b.repo_deps_lock.Lock()
 	defer b.repo_deps_lock.Unlock()
-
-	// Should only be called when loaded from Begotten, not lockfile.
-	b.bf.set_deps(b.out_deps)
-	b.bf.set_repo_deps(b.repo_deps)
-	b.bf.save(filepath.Join(b.code_root, BEGOTTEN_LOCK))
+	b.bf.save(filepath.Join(b.code_root, BEGOTTEN_LOCK), b.resolved_deps, b.repo_deps)
 	return b
 }
 
@@ -595,7 +614,7 @@ func (b *Builder) _repo_dir(url string) string {
 
 var RE_SHA1_HASH = regexp.MustCompile("[[:xdigit:]]{40}")
 
-func (b *Builder) _resolve_ref(url, ref string, should_fetch func(string) bool) (resolved_ref string) {
+func (b *Builder) _resolve_ref(url, ref string, should_fetch bool) (resolved_ref string) {
 	if ref == FLOAT {
 		return FLOAT
 	}
@@ -608,7 +627,7 @@ func (b *Builder) _resolve_ref(url, ref string, should_fetch func(string) bool) 
 		// Get into detached head state so we can manipulate things without
 		// worrying about messing up a branch.
 		cc(repo_dir, "git", "checkout", "-q", "--detach")
-	} else if should_fetch != nil && should_fetch(url) {
+	} else if should_fetch {
 		fmt.Printf("Updating %s\n", url)
 		cc(repo_dir, "git", "fetch", "-q")
 	}
@@ -628,7 +647,7 @@ func (b *Builder) _resolve_ref(url, ref string, should_fetch func(string) bool) 
 	panic(fmt.Errorf("Can't resolve reference %q for %s", ref, url))
 }
 
-func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
+func (b *Builder) _setup_repo(url, resolved_ref string, new_dep func(dep RequestedDep)) {
 	repo_dir := b._repo_dir(url)
 
 	fmt.Printf("Fixing imports in %s\n", url)
@@ -641,34 +660,33 @@ func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
 
 	// Match up sub-deps to our deps.
 	sub_dep_map := make(map[string]string)
-	self_deps := []Dep{}
+	self_deps := []RequestedDep{}
 	sub_bg_path := filepath.Join(repo_dir, BEGOTTEN_LOCK)
 	if _, err := os.Stat(sub_bg_path); err == nil {
 		sub_bg := BegottenFileNew(sub_bg_path)
 		// Add implicit and explicit external dependencies.
-		for _, sub_dep := range sub_bg.deps() {
+		for _, sub_dep := range sub_bg.resolved_deps() {
 			for i, s := range sub_dep.Source {
 				sub_dep.Source[i] = url + " => " + s
 			}
 
 			b._record_repo_dep(url, sub_dep.Git_url)
 
-			our_dep := b._lookup_dep_by_git_url_and_path(sub_dep.Git_url, sub_dep.Subpath)
-
+			new_name := implicit_name(sub_dep.Git_url, sub_dep.Subpath)
+			our_dep := b._lookup_explicit_dep(sub_dep.Git_url, sub_dep.Subpath)
 			if our_dep != nil {
-				if sub_dep.Ref != our_dep.Ref {
-					real_ref := b._resolve_ref(our_dep.Git_url, our_dep.Ref, nil)
-					panic(fmt.Errorf("Conflict: %s depends on %s at %s, we depend on it at %s (%s)",
-						url, sub_dep.Git_url, sub_dep.Ref, our_dep.Ref, real_ref))
-				}
-				sub_dep_map[sub_dep.name] = our_dep.name
-			} else {
-				orig_name := sub_dep.name
-				sub_dep.set_implicit_name()
-				//sub_dep.Source = append(sub_dep.Source, fmt.Sprintf("transitive dep of %s in %s", orig_name, url))
-				sub_dep_map[orig_name] = sub_dep.name
-				new_deps = append(new_deps, sub_dep)
+				// Even though we have a dep already, we send another copy
+				// through to check that the versions match.
+				new_name = our_dep.name
 			}
+			sub_dep_map[sub_dep.name] = new_name
+			new_dep(RequestedDep{
+				name:    new_name,
+				Git_url: sub_dep.Git_url,
+				Ref:     sub_dep.Commit_id,
+				Subpath: sub_dep.Subpath,
+				Source:  sub_dep.Source,
+			})
 		}
 		// Allow relative import paths within this repo.
 		e := filepath.Walk(repo_dir, func(path string, fi os.FileInfo, err error) error {
@@ -681,13 +699,17 @@ func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
 				return nil
 			}
 			relpath := path[len(repo_dir)+1:]
-			our_dep := b._lookup_dep_by_git_url_and_path(url, relpath)
+			our_dep := b._lookup_explicit_dep(url, relpath)
 			if our_dep != nil {
 				sub_dep_map[relpath] = our_dep.name
 			} else {
-				dep := Dep{name: "", Git_url: url, Subpath: relpath, Ref: resolved_ref,
-					Source: []string{fmt.Sprintf("self dep for %s in %s", relpath, url)}}
-				dep.set_implicit_name()
+				dep := RequestedDep{
+					name:    implicit_name(url, relpath),
+					Git_url: url,
+					Subpath: relpath,
+					Ref:     resolved_ref,
+					Source:  []string{fmt.Sprintf("self dep for %s in %s", relpath, url)},
+				}
 				sub_dep_map[relpath] = dep.name
 				self_deps = append(self_deps, dep)
 			}
@@ -699,36 +721,32 @@ func (b *Builder) _setup_repo(url, resolved_ref string) (new_deps []Dep) {
 	}
 
 	used_rewrites := make(map[string]bool)
-	deps := b._rewrite_imports(url, repo_dir, &sub_dep_map, &used_rewrites)
-	new_deps = append(new_deps, deps...)
+	b._rewrite_imports(url, repo_dir, &sub_dep_map, &used_rewrites, new_dep)
 	msg := fmt.Sprintf("rewritten by begot for %s", b.code_root)
 	cc(repo_dir, "git", "commit", "--allow-empty", "-a", "-q", "-m", msg)
 
 	// Add only the self-deps that were used, to reduce clutter.
 	for _, self_dep := range self_deps {
 		if used_rewrites[self_dep.name] {
-			new_deps = append(new_deps, self_dep)
+			new_dep(self_dep)
 		}
 	}
-
-	return
 }
 
-func (b *Builder) _rewrite_imports(src_url, repo_dir string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) (new_deps []Dep) {
+func (b *Builder) _rewrite_imports(src_url, repo_dir string, sub_dep_map *map[string]string, used_rewrites *map[string]bool, new_dep func(RequestedDep)) {
 	filepath.Walk(repo_dir, func(path string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if strings.HasSuffix(path, ".go") {
-			deps := b._rewrite_file(src_url, path, sub_dep_map, used_rewrites)
-			new_deps = append(new_deps, deps...)
+			b._rewrite_file(src_url, path, sub_dep_map, used_rewrites, new_dep)
 		}
 		return nil
 	})
 	return
 }
 
-func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) (new_deps []Dep) {
+func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]string, used_rewrites *map[string]bool, new_dep func(RequestedDep)) {
 	bts, err := ioutil.ReadFile(path)
 	if err != nil {
 		panic(err)
@@ -748,8 +766,7 @@ func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]st
 		start := fs.Position(imp.Path.Pos()).Offset
 		end := fs.Position(imp.Path.End()).Offset
 		orig_import := string(bts[start+1 : end-1])
-		rewritten, deps := b._rewrite_import(src_url, orig_import, sub_dep_map, used_rewrites)
-		new_deps = append(new_deps, deps...)
+		rewritten := b._rewrite_import(src_url, orig_import, sub_dep_map, used_rewrites, new_dep)
 		if orig_import != rewritten {
 			out.Write(bts[pos : start+1])
 			out.WriteString(rewritten)
@@ -761,10 +778,9 @@ func (b *Builder) _rewrite_file(src_url, path string, sub_dep_map *map[string]st
 	if err := ioutil.WriteFile(path, out.Bytes(), 0666); err != nil {
 		panic(err)
 	}
-	return
 }
 
-func (b *Builder) _rewrite_import(src_url, imp string, sub_dep_map *map[string]string, used_rewrites *map[string]bool) (new_imp string, new_deps []Dep) {
+func (b *Builder) _rewrite_import(src_url, imp string, sub_dep_map *map[string]string, used_rewrites *map[string]bool, new_dep func(RequestedDep)) (new_imp string) {
 	new_imp = imp
 	if rewrite, ok := (*sub_dep_map)[imp]; ok {
 		new_imp = rewrite
@@ -772,36 +788,30 @@ func (b *Builder) _rewrite_import(src_url, imp string, sub_dep_map *map[string]s
 	} else {
 		parts := strings.Split(imp, "/")
 		if _, ok := KNOWN_GIT_SERVERS[parts[0]]; ok {
-			new_imp, new_deps = b._lookup_dep_name(src_url, imp)
+			new_imp = b._lookup_dep_name(src_url, imp, new_dep)
 		}
 	}
 	return
 }
 
-func (b *Builder) _lookup_dep_name(src_url, imp string) (name string, new_deps []Dep) {
+func (b *Builder) _lookup_dep_name(src_url, imp string, new_dep func(RequestedDep)) (name string) {
+	as_dep := b.bf.parse_dep("", imp, FLOAT, "")
+	as_dep.name = implicit_name(as_dep.Git_url, as_dep.Subpath)
+	as_dep.Source[0] = fmt.Sprintf("%s -> %s", src_url, as_dep.Git_url)
+	b._record_repo_dep(src_url, as_dep.Git_url)
+
 	// Check if this matches one of our explicit deps.
-	// TODO: It's kind of gross to look through b.deps here. But b.deps is
-	// read-only while we're processing deps, so it's ok.
-	for _, dep := range b.deps {
-		if contains_str(dep.Aliases, imp) {
-			name = dep.name
-			b._record_repo_dep(src_url, dep.Git_url)
-			return
-		}
+	our_dep := b._lookup_explicit_dep(as_dep.Git_url, as_dep.Subpath)
+	if our_dep != nil {
+		return our_dep.name
+	} else { // Otherwise it's a new implicit dep.
+		new_dep(as_dep)
+		return as_dep.name
 	}
-
-	// Otherwise it's a new implicit dep.
-	dep := b.bf.parse_dep("", imp, FLOAT, fmt.Sprintf("%s -> %s", src_url, imp))
-	dep.set_implicit_name()
-	name = dep.name
-	new_deps = []Dep{dep}
-	b._record_repo_dep(src_url, dep.Git_url)
-	return
 }
 
-func (b *Builder) _lookup_dep_by_git_url_and_path(git_url string, subpath string) *Dep {
-	// TODO: same comment as above
-	for _, dep := range b.deps {
+func (b *Builder) _lookup_explicit_dep(git_url string, subpath string) *RequestedDep {
+	for _, dep := range b.requested_deps {
 		if dep.Git_url == git_url && dep.Subpath == subpath {
 			return &dep
 		}
@@ -812,7 +822,7 @@ func (b *Builder) _lookup_dep_by_git_url_and_path(git_url string, subpath string
 func (b *Builder) tag_repos() {
 	// Run this after setup_repos.
 	var wg sync.WaitGroup
-	for url, ref := range b._all_repos(b.out_deps) {
+	for url, ref := range b._all_repos(b.resolved_deps) {
 		wg.Add(1)
 		go func(url, ref string) {
 			repo_dir := b._repo_dir(url)
@@ -847,7 +857,7 @@ func (b *Builder) _tag_hash(ref string) string {
 }
 
 func (b *Builder) run(args []string) {
-	deps := b.bf.deps()
+	deps := b.bf.resolved_deps()
 	b._reset_to_tags(deps)
 
 	// Set up code_wk.
@@ -948,7 +958,7 @@ func (b *Builder) run(args []string) {
 	}
 }
 
-func (b *Builder) _reset_to_tags(deps []Dep) {
+func (b *Builder) _reset_to_tags(deps []ResolvedDep) {
 	var wg sync.WaitGroup
 	for url, ref := range b._all_repos(deps) {
 		wg.Add(1)

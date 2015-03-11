@@ -109,7 +109,7 @@ def clear_cache():
   clear_dir(cachedir)
 
 def read_lockfile_deps(expected_count):
-  deps = yaml.safe_load(open('Begotten.lock'))['deps']
+  deps = yaml.safe_load(open('Begotten.lock'))['resolved_deps']
   assert len(deps) == expected_count
   return deps
 
