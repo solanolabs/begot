@@ -26,10 +26,11 @@ const (
 	BEGOTTEN      = "Begotten"
 	BEGOTTEN_LOCK = "Begotten.lock"
 
-	DEFAULT_BRANCH = "master"
+	// Sentinel values
+	GO1_OR_MASTER = "_begot_go1_or_master"
+	FLOAT         = "_begot_float"
 
 	EMPTY_DEP = "_begot_empty_dep"
-	FLOAT     = "_begot_float"
 
 	// This should change if the format of Begotten.lock changes in an incompatible
 	// way. (But prefer changing it in compatible ways and not incrementing this.)
@@ -296,7 +297,7 @@ func (bf *BegottenFile) requested_deps() (out []RequestedDep) {
 	out = make([]RequestedDep, len(bf.data.Deps))
 	i := 0
 	for name, v := range bf.data.Deps {
-		out[i] = bf.parse_dep(name, v, DEFAULT_BRANCH, "explicit")
+		out[i] = bf.parse_dep(name, v, GO1_OR_MASTER, "explicit")
 		i++
 	}
 	return
@@ -602,7 +603,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 			// No progress. Default everything so far to master.
 			// FIXME: is this really an accurate signal of no progress?
 			for i := range postponed_deps {
-				postponed_deps[i].Ref = DEFAULT_BRANCH
+				postponed_deps[i].Ref = GO1_OR_MASTER
 			}
 		}
 
@@ -672,7 +673,12 @@ func (b *Builder) _resolve_ref(url, ref string, should_fetch bool) (resolved_ref
 		return ref
 	}
 
-	for _, pfx := range []string{"origin/", ""} {
+	pfxs := []string{"origin/", ""}
+	if ref == GO1_OR_MASTER {
+		pfxs = []string{"origin/go1", "origin/master"}
+		ref = ""
+	}
+	for _, pfx := range pfxs {
 		cmd := Command(repo_dir, "git", "rev-parse", "--verify", pfx+ref)
 		cmd.Stderr = nil
 		if outb, err := cmd.Output(); err == nil {
@@ -680,6 +686,7 @@ func (b *Builder) _resolve_ref(url, ref string, should_fetch bool) (resolved_ref
 			return
 		}
 	}
+
 	panic(fmt.Errorf("Can't resolve reference %q for %s", ref, url))
 }
 
