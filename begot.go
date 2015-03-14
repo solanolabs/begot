@@ -457,8 +457,9 @@ func (b *Builder) _process(
 	should_fetch bool,
 	my_chan chan RequestedDep,
 	new_dep func(RequestedDep),
+	postpone_dep func(RequestedDep),
 	out_dep func(ResolvedDep),
-	in_wg *sync.WaitGroup) {
+	in_wg, out_wg *sync.WaitGroup) {
 
 	defer func() {
 		if err := recover(); err != nil {
@@ -504,9 +505,8 @@ func (b *Builder) _process(
 				have = want
 				b._setup_repo(url, have, new_dep)
 			} else {
-				// Put back on the end of the queue.
-				// FIXME: really???
-				go func(d RequestedDep) { my_chan <- d }(dep)
+				postpone_dep(dep)
+				in_wg.Done()
 				continue
 			}
 		}
@@ -530,6 +530,7 @@ func (b *Builder) _process(
 	for _, dep := range out {
 		out_dep(dep)
 	}
+	out_wg.Done()
 }
 
 func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
@@ -538,21 +539,28 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	// After this point, b.locked_refs and b.requested_deps are constant, so
 	// other goroutines can read from them.
 
-	input := make(chan RequestedDep)
-	output := make(chan ResolvedDep)
+	input := make(chan RequestedDep, 100) // FIXME: should use unlimited buffer
 
 	var out_wg, in_wg sync.WaitGroup
+
+	postponed_deps := make([]RequestedDep, 0)
+	var output_lock, postponed_lock sync.Mutex
 
 	new_dep := func(dep RequestedDep) {
 		in_wg.Add(1)
 		input <- dep
 	}
+	postpone_dep := func(dep RequestedDep) {
+		postponed_lock.Lock()
+		postponed_deps = append(postponed_deps, dep)
+		postponed_lock.Unlock()
+	}
 	out_dep := func(dep ResolvedDep) {
-		out_wg.Add(1)
-		output <- dep
+		output_lock.Lock()
+		b.resolved_deps = append(b.resolved_deps, dep)
+		output_lock.Unlock()
 	}
 
-	out_wg.Add(1)
 	go func() {
 		chans := make(map[string]chan RequestedDep)
 		for dep := range input {
@@ -561,30 +569,54 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 			} else {
 				c = make(chan RequestedDep)
 				chans[dep.Git_url] = c
-				go b._process(dep.Git_url, fetch, c, new_dep, out_dep, &in_wg)
+				out_wg.Add(1)
+				go b._process(dep.Git_url, fetch, c, new_dep, postpone_dep, out_dep, &in_wg, &out_wg)
 				c <- dep
 			}
 		}
 		for _, c := range chans {
 			close(c)
 		}
-		out_wg.Done()
-	}()
-
-	go func() {
-		for dep := range output {
-			b.resolved_deps = append(b.resolved_deps, dep)
-			out_wg.Done()
-		}
 	}()
 
 	for _, dep := range b.requested_deps {
 		new_dep(dep)
 	}
-	in_wg.Wait()
+
+	prev_round := -1
+	for {
+		// Wait for all the deps to make their way through _process.
+		in_wg.Wait()
+
+		// Examine postponed deps.
+		postponed_lock.Lock()
+
+		if len(postponed_deps) == 0 {
+			// We're done.
+			break
+		} else if len(postponed_deps) == prev_round {
+			// No progress. Default everything so far to master.
+			// FIXME: is this really an accurate signal of no progress?
+			for i := range postponed_deps {
+				postponed_deps[i].Ref = DEFAULT_BRANCH
+			}
+		}
+
+		// Send them back again.
+		prev_round = len(postponed_deps)
+		for _, dep := range postponed_deps {
+			new_dep(dep)
+		}
+		postponed_deps = postponed_deps[0:0]
+
+		postponed_lock.Unlock()
+	}
+
+	// This close gets propagated to all of the _process routines and causes
+	// them to dump their output.
 	close(input)
+	// Wait for everyone to output their deps
 	out_wg.Wait()
-	close(output)
 
 	return b
 }
