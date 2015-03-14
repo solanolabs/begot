@@ -33,7 +33,7 @@ const (
 
 	// This should change if the format of Begotten.lock changes in an incompatible
 	// way. (But prefer changing it in compatible ways and not incrementing this.)
-	FILE_VERSION = 1
+	FILE_VERSION = 2
 )
 
 // Known public servers and how many path components form the repo name.
@@ -512,7 +512,11 @@ func (b *Builder) _process(
 		}
 
 		if outdep, ok := out[dep.Subpath]; ok {
-			outdep.Source = append(outdep.Source, dep.Source...)
+			for _, new_src := range dep.Source {
+				if !contains_str(outdep.Source, new_src) {
+					outdep.Source = append(outdep.Source, new_src)
+				}
+			}
 			out[dep.Subpath] = outdep
 		} else {
 			out[dep.Subpath] = ResolvedDep{
@@ -539,7 +543,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	// After this point, b.locked_refs and b.requested_deps are constant, so
 	// other goroutines can read from them.
 
-	input := make(chan RequestedDep, 100) // FIXME: should use unlimited buffer
+	input := make(chan RequestedDep, 500) // FIXME: should use unlimited buffer
 
 	var out_wg, in_wg sync.WaitGroup
 
@@ -827,9 +831,8 @@ func (b *Builder) _rewrite_import(src_url, imp string, sub_dep_map *map[string]s
 }
 
 func (b *Builder) _lookup_dep_name(src_url, imp string, new_dep func(RequestedDep)) (name string) {
-	as_dep := b.bf.parse_dep("", imp, FLOAT, "")
+	as_dep := b.bf.parse_dep("", imp, FLOAT, src_url)
 	as_dep.name = implicit_name(as_dep.Git_url, as_dep.Subpath)
-	as_dep.Source[0] = fmt.Sprintf("%s -> %s", src_url, as_dep.Git_url)
 	b._record_repo_dep(src_url, as_dep.Git_url)
 
 	// Check if this matches one of our explicit deps.
