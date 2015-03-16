@@ -29,6 +29,7 @@ const (
 	// Sentinel values
 	GO1_OR_MASTER = "_begot_go1_or_master"
 	FLOAT         = "_begot_float"
+	INPUT_DONE    = "_done"
 
 	EMPTY_DEP = "_begot_empty_dep"
 
@@ -535,17 +536,20 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	// After this point, b.locked_refs and b.requested_deps are constant, so
 	// other goroutines can read from them.
 
-	input := make(chan RequestedDep, 500) // FIXME: should use unlimited buffer
-
 	var out_wg, in_wg sync.WaitGroup
 
+	input := make([]RequestedDep, 0)
 	postponed_deps := make([]RequestedDep, 0)
 	progress := 0
-	var output_lock, postponed_lock sync.Mutex
+	var input_lock, output_lock, postponed_lock sync.Mutex
+	input_cond := sync.NewCond(&input_lock)
 
 	new_dep := func(dep RequestedDep) {
 		in_wg.Add(1)
-		input <- dep
+		input_lock.Lock()
+		input = append(input, dep)
+		input_lock.Unlock()
+		input_cond.Signal()
 	}
 	postpone_dep := func(dep RequestedDep) {
 		postponed_lock.Lock()
@@ -565,7 +569,19 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 
 	go func() {
 		chans := make(map[string]chan RequestedDep)
-		for dep := range input {
+		for {
+			input_lock.Lock()
+			for len(input) == 0 {
+				input_cond.Wait()
+			}
+			dep := input[len(input)-1]
+			input = input[:len(input)-1]
+			input_lock.Unlock()
+
+			if dep.name == INPUT_DONE {
+				break
+			}
+
 			if c, ok := chans[dep.Git_url]; ok {
 				c <- dep
 			} else {
@@ -614,7 +630,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 
 	// This close gets propagated to all of the _process routines and causes
 	// them to dump their output.
-	close(input)
+	new_dep(RequestedDep{name: INPUT_DONE})
 
 	// Wait for everyone to output their deps to b.resolved_deps.
 	out_wg.Wait()
