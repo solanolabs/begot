@@ -459,6 +459,7 @@ func (b *Builder) _process(
 	my_chan chan RequestedDep,
 	new_dep func(RequestedDep),
 	postpone_dep func(RequestedDep),
+	inc_progress func(),
 	out_dep func(ResolvedDep),
 	in_wg, out_wg *sync.WaitGroup) {
 
@@ -468,17 +469,6 @@ func (b *Builder) _process(
 			os.Exit(1)
 		}
 	}()
-
-	// problem 1: we need a ref before we can setup and get deps of this repo.
-	// DONE.
-	// problem 2: the rewrite step needs to be able to look up a name from a
-	// url+path. we can hash so that they all end up at the same name, but that
-	// doesn't help to match up sub-deps to explicit deps, and we need to do
-	// that to avoid duplicating. DONE.
-	// problem 3: we need to postpone processing when we get a FLOAT.
-	// might be solved?
-	// problem 4: if we get all floats, we need to default to master and _then_
-	// process more deps. that strongly suggests a round structure...
 
 	out := make(map[string]ResolvedDep) // map from subpath to ResolvedDep
 
@@ -529,6 +519,7 @@ func (b *Builder) _process(
 			}
 		}
 
+		inc_progress()
 		in_wg.Done()
 	}
 
@@ -549,6 +540,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	var out_wg, in_wg sync.WaitGroup
 
 	postponed_deps := make([]RequestedDep, 0)
+	progress := 0
 	var output_lock, postponed_lock sync.Mutex
 
 	new_dep := func(dep RequestedDep) {
@@ -558,6 +550,11 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	postpone_dep := func(dep RequestedDep) {
 		postponed_lock.Lock()
 		postponed_deps = append(postponed_deps, dep)
+		postponed_lock.Unlock()
+	}
+	inc_progress := func() {
+		postponed_lock.Lock()
+		progress += 1
 		postponed_lock.Unlock()
 	}
 	out_dep := func(dep ResolvedDep) {
@@ -575,7 +572,7 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 				c = make(chan RequestedDep)
 				chans[dep.Git_url] = c
 				out_wg.Add(1)
-				go b._process(dep.Git_url, fetch, c, new_dep, postpone_dep, out_dep, &in_wg, &out_wg)
+				go b._process(dep.Git_url, fetch, c, new_dep, postpone_dep, inc_progress, out_dep, &in_wg, &out_wg)
 				c <- dep
 			}
 		}
@@ -588,7 +585,6 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 		new_dep(dep)
 	}
 
-	prev_round := -1
 	for {
 		// Wait for all the deps to make their way through _process.
 		in_wg.Wait()
@@ -599,19 +595,18 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 		if len(postponed_deps) == 0 {
 			// We're done.
 			break
-		} else if len(postponed_deps) == prev_round {
-			// No progress. Default everything so far to master.
-			// FIXME: is this really an accurate signal of no progress?
+		} else if progress == 0 {
+			// No progress. Default everything so far to go1/master.
 			for i := range postponed_deps {
 				postponed_deps[i].Ref = GO1_OR_MASTER
 			}
 		}
 
 		// Send them back again.
-		prev_round = len(postponed_deps)
 		for _, dep := range postponed_deps {
 			new_dep(dep)
 		}
+		progress = 0
 		postponed_deps = postponed_deps[0:0]
 
 		postponed_lock.Unlock()
@@ -620,7 +615,8 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	// This close gets propagated to all of the _process routines and causes
 	// them to dump their output.
 	close(input)
-	// Wait for everyone to output their deps
+
+	// Wait for everyone to output their deps to b.resolved_deps.
 	out_wg.Wait()
 
 	return b
