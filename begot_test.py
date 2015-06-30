@@ -102,7 +102,10 @@ def make_begot_workdir(deps, files):
 
 def clear_dir(d):
   if os.path.exists(d):
-    shutil.rmtree(d)
+    try:
+      shutil.rmtree(d)
+    except OSError: # handle weird race conditions
+      shutil.rmtree(d)
   os.mkdir(d)
 
 def clear_cache():
@@ -656,7 +659,7 @@ def test_conflict_between_dep_and_dep_of_dep():
        'tp/otherdep': {'import_path': 'begot.test/otheruser/repo', 'ref': 'one'}},
       {'app/main.go': MAIN_GO})
 
-  begot_err('update', expect="Conflict:")
+  begot_err('update', expect="Conflicting versions")
 
 
 def test_nonconflict_between_dep_with_ref_and_implicit_dep():
@@ -685,7 +688,7 @@ def test_nonconflict_between_dep_with_ref_and_implicit_dep():
   deps = read_lockfile_deps(2)
   otherdep = deps.pop('tp/otherdep')
   assert otherdep['git_url'].endswith('otheruser/repo')
-  assert otherdep['ref'] == one
+  assert otherdep['commit_id'] == one
 
   clear_cache_fetch_twice_and_build()
 
@@ -708,7 +711,7 @@ def test_dep_with_branch():
 
   deps = read_lockfile_deps(1)
   dep = deps.pop('tp/dep')
-  assert dep['ref'] == branch
+  assert dep['commit_id'] == branch
 
   clear_cache_fetch_twice_and_build()
 
@@ -731,7 +734,7 @@ def test_dep_with_commit_id():
 
   deps = read_lockfile_deps(1)
   dep = deps.pop('tp/dep')
-  assert dep['ref'] == ref
+  assert dep['commit_id'] == ref
 
   clear_cache_fetch_twice_and_build()
 
@@ -788,8 +791,8 @@ def test_full_update():
   begot('update')
 
   before = read_lockfile_deps(2)
-  oneb = before['tp/dep1']['ref']
-  twob = before['tp/dep2']['ref']
+  oneb = before['tp/dep1']['commit_id']
+  twob = before['tp/dep2']['commit_id']
 
   for repo in 'user/repo1', 'user/repo2':
     with chdir(repo_path(repo)):
@@ -800,8 +803,8 @@ def test_full_update():
   begot('update')
 
   after = read_lockfile_deps(2)
-  onea = after['tp/dep1']['ref']
-  twoa = after['tp/dep2']['ref']
+  onea = after['tp/dep1']['commit_id']
+  twoa = after['tp/dep2']['commit_id']
 
   assert oneb != onea
   assert twob != twoa
@@ -820,9 +823,9 @@ def test_limited_update():
   begot('update')
 
   before = read_lockfile_deps(3)
-  oneb = before['tp/dep1']['ref']
-  twob = before['tp/dep2']['ref']
-  threeb = before['tp/dep3']['ref']
+  oneb = before['tp/dep1']['commit_id']
+  twob = before['tp/dep2']['commit_id']
+  threeb = before['tp/dep3']['commit_id']
 
   for repo in 'user/repo1', 'user/repo2':
     with chdir(repo_path(repo)):
@@ -833,9 +836,9 @@ def test_limited_update():
   begot('update', 'tp/dep2')
 
   after = read_lockfile_deps(3)
-  onea = after['tp/dep1']['ref']
-  twoa = after['tp/dep2']['ref']
-  threea = after['tp/dep3']['ref']
+  onea = after['tp/dep1']['commit_id']
+  twoa = after['tp/dep2']['commit_id']
+  threea = after['tp/dep3']['commit_id']
 
   assert oneb == onea
   assert twob != twoa
@@ -857,9 +860,9 @@ def test_limited_update_with_implicit_dep():
   begot('update')
 
   before = read_lockfile_deps(3)
-  oneb = before.pop('tp/dep1')['ref']
-  twob = before.pop('tp/dep2')['ref']
-  otherb = before.popitem()[1]['ref']
+  oneb = before.pop('tp/dep1')['commit_id']
+  twob = before.pop('tp/dep2')['commit_id']
+  otherb = before.popitem()[1]['commit_id']
 
   for repo in 'user/repo1', 'user/repo2', 'otheruser/repo':
     with chdir(repo_path(repo)):
@@ -870,9 +873,9 @@ def test_limited_update_with_implicit_dep():
   begot('update', 'tp/dep1')
 
   after = read_lockfile_deps(3)
-  onea = after.pop('tp/dep1')['ref']
-  twoa = after.pop('tp/dep2')['ref']
-  othera = after.popitem()[1]['ref']
+  onea = after.pop('tp/dep1')['commit_id']
+  twoa = after.pop('tp/dep2')['commit_id']
+  othera = after.popitem()[1]['commit_id']
 
   assert oneb != onea
   assert twob == twoa
@@ -894,9 +897,9 @@ def test_limited_update_with_explicit_dep():
   begot('update')
 
   before = read_lockfile_deps(3)
-  oneb = before.pop('tp/dep1')['ref']
-  twob = before.pop('tp/dep2')['ref']
-  otherb = before.popitem()[1]['ref']
+  oneb = before.pop('tp/dep1')['commit_id']
+  twob = before.pop('tp/dep2')['commit_id']
+  otherb = before.popitem()[1]['commit_id']
 
   for repo in 'otheruser/repo', 'user/repo1', 'user/repo2':
     with chdir(repo_path(repo)):
@@ -909,9 +912,9 @@ def test_limited_update_with_explicit_dep():
   begot('update', 'tp/dep1')
 
   after = read_lockfile_deps(3)
-  onea = after.pop('tp/dep1')['ref']
-  twoa = after.pop('tp/dep2')['ref']
-  othera = after.popitem()[1]['ref']
+  onea = after.pop('tp/dep1')['commit_id']
+  twoa = after.pop('tp/dep2')['commit_id']
+  othera = after.popitem()[1]['commit_id']
 
   assert oneb != onea
   assert twob == twoa
@@ -1129,12 +1132,14 @@ def global_teardown():
   os.chdir('/')
   shutil.rmtree(tmpdir)
 
-def run_tests(shard=0, count=1):
+def run_tests(shard=0, count=1, argv=None):
   passed = failed = 0
+  failed_names = []
   for i, (name, func) in enumerate(sorted(globals().items())):
     if not callable(func): continue
     if not name.startswith('test'): continue
     if (i % count) != shard: continue
+    if argv and name not in argv: continue
 
     # clean up
     clear_cache()
@@ -1158,8 +1163,12 @@ def run_tests(shard=0, count=1):
       print 'FAIL'
       traceback.print_exc()
       failed += 1
+      failed_names.append(name)
   print
   print '%d passed, %d failed' % (passed, failed)
+  print
+  if failed_names:
+    print 'Failing tests:', ' '.join(sorted(failed_names))
   return int(failed > 0)
 
 
@@ -1167,7 +1176,7 @@ def main():
   try:
     global_setup()
     shard, count = map(int, os.getenv('SHARD', '0/1').split('/'))
-    retval = run_tests(shard, count)
+    retval = run_tests(shard, count, sys.argv[1:])
     sys.exit(retval)
   finally:
     global_teardown()

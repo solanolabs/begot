@@ -151,7 +151,9 @@ type ResolvedDep struct {
 // A Begotten or Begotten.lock file contains exactly one of these in YAML format.
 type BegottenFileStruct struct {
 	// in Begotten:
-	Deps         map[string]interface{} // either string or RequestedDep
+	Deps map[string]interface{} // either string or RequestedDep
+
+	// in both:
 	Repo_aliases map[string]interface{} // either string or subset of RequestedDep {git_url, ref}
 
 	// in Begotten.lock:
@@ -194,7 +196,8 @@ func (sm SortedStringMap) Swap(i, j int) {
 	sm[i], sm[j] = sm[j], sm[i]
 }
 
-func (bf *BegottenFile) save(fn string, deps []ResolvedDep, repo_deps map[string][]string) {
+func (bf *BegottenFile) save(fn string, deps []ResolvedDep, repo_deps map[string][]string,
+	repo_aliases map[string]interface{}) {
 	// We have to sort everything so the output is deterministic. go-yaml
 	// doesn't write maps in sorted order, so we have to convert them to
 	// yaml.MapSlices and sort those.
@@ -203,12 +206,18 @@ func (bf *BegottenFile) save(fn string, deps []ResolvedDep, repo_deps map[string
 			File_version int
 			Generated_by string
 		}
+		Repo_aliases  SortedStringMap
 		Repo_deps     SortedStringMap
 		Resolved_deps SortedStringMap
 	}
 
 	out.Meta.File_version = FILE_VERSION
 	out.Meta.Generated_by = CODE_VERSION
+
+	for k, v := range repo_aliases {
+		out.Repo_aliases = append(out.Repo_aliases, yaml.MapItem{k, v})
+	}
+	sort.Sort(out.Repo_aliases)
 
 	for k, v := range repo_deps {
 		sort.StringSlice(v).Sort()
@@ -313,6 +322,13 @@ func (bf *BegottenFile) resolved_deps() (out []ResolvedDep) {
 		i++
 	}
 	return
+}
+
+func (bf *BegottenFile) repo_aliases() map[string]interface{} {
+	if bf.data.Repo_aliases == nil {
+		bf.data.Repo_aliases = make(map[string]interface{})
+	}
+	return bf.data.Repo_aliases
 }
 
 func (bf *BegottenFile) repo_deps() map[string][]string {
@@ -482,7 +498,9 @@ func (b *Builder) _process(
 			want = locked
 		} else {
 			want = b._resolve_ref(url, dep.Ref, should_fetch)
-			should_fetch = false // only fetch at most once
+			if want != FLOAT {
+				should_fetch = false // only fetch at most once
+			}
 		}
 
 		if have != "" {
@@ -638,10 +656,35 @@ func (b *Builder) setup_repos(fetch bool, limits []string) *Builder {
 	return b
 }
 
+func (b *Builder) fetch_repos() *Builder {
+	var wg sync.WaitGroup
+
+	b.resolved_deps = b.bf.resolved_deps()
+
+	repos := make(map[string]bool)
+	new_dep := func(RequestedDep) {}
+
+	for _, dep := range b.resolved_deps {
+		if done, _ := repos[dep.Git_url]; !done {
+			repos[dep.Git_url] = true
+			wg.Add(1)
+			go func(dep ResolvedDep) {
+				b._fetch_repo(dep.Git_url, false)
+				b._setup_repo(dep.Git_url, dep.Commit_id, new_dep)
+				wg.Done()
+			}(dep)
+		}
+	}
+
+	wg.Wait()
+
+	return b
+}
+
 func (b *Builder) save_lockfile() *Builder {
 	b.repo_deps_lock.Lock()
 	defer b.repo_deps_lock.Unlock()
-	b.bf.save(filepath.Join(b.code_root, BEGOTTEN_LOCK), b.resolved_deps, b.repo_deps)
+	b.bf.save(filepath.Join(b.code_root, BEGOTTEN_LOCK), b.resolved_deps, b.repo_deps, b.bf.repo_aliases())
 	return b
 }
 
@@ -661,13 +704,7 @@ func (b *Builder) _repo_dir(url string) string {
 	return filepath.Join(b.env.RepoDir, sha1str(url))
 }
 
-var RE_SHA1_HASH = regexp.MustCompile("[[:xdigit:]]{40}")
-
-func (b *Builder) _resolve_ref(url, ref string, should_fetch bool) (resolved_ref string) {
-	if ref == FLOAT {
-		return FLOAT
-	}
-
+func (b *Builder) _fetch_repo(url string, should_fetch bool) {
 	repo_dir := b._repo_dir(url)
 
 	if fi, err := os.Stat(repo_dir); err != nil || !fi.Mode().IsDir() {
@@ -680,6 +717,18 @@ func (b *Builder) _resolve_ref(url, ref string, should_fetch bool) (resolved_ref
 		fmt.Printf("Updating %s\n", url)
 		cc(repo_dir, "git", "fetch", "-q")
 	}
+}
+
+var RE_SHA1_HASH = regexp.MustCompile("[[:xdigit:]]{40}")
+
+func (b *Builder) _resolve_ref(url, ref string, should_fetch bool) (resolved_ref string) {
+	if ref == FLOAT {
+		return FLOAT
+	}
+
+	repo_dir := b._repo_dir(url)
+
+	b._fetch_repo(url, should_fetch)
 
 	if RE_SHA1_HASH.MatchString(ref) {
 		return ref
@@ -729,10 +778,10 @@ func (b *Builder) _setup_repo(url, resolved_ref string, new_dep func(dep Request
 
 			new_name := implicit_name(sub_dep.Git_url, sub_dep.Subpath)
 			our_dep := b._lookup_explicit_dep(sub_dep.Git_url, sub_dep.Subpath)
-			if our_dep != nil {
+			if our_dep != "" {
 				// Even though we have a dep already, we send another copy
 				// through to check that the versions match.
-				new_name = our_dep.name
+				new_name = our_dep
 			}
 			sub_dep_map[sub_dep.name] = new_name
 			new_dep(RequestedDep{
@@ -755,8 +804,8 @@ func (b *Builder) _setup_repo(url, resolved_ref string, new_dep func(dep Request
 			}
 			relpath := path[len(repo_dir)+1:]
 			our_dep := b._lookup_explicit_dep(url, relpath)
-			if our_dep != nil {
-				sub_dep_map[relpath] = our_dep.name
+			if our_dep != "" {
+				sub_dep_map[relpath] = our_dep
 			} else {
 				dep := RequestedDep{
 					name:    implicit_name(url, relpath),
@@ -856,21 +905,29 @@ func (b *Builder) _lookup_dep_name(src_url, imp string, new_dep func(RequestedDe
 
 	// Check if this matches one of our explicit deps.
 	our_dep := b._lookup_explicit_dep(as_dep.Git_url, as_dep.Subpath)
-	if our_dep != nil {
-		return our_dep.name
+	if our_dep != "" {
+		return our_dep
 	} else { // Otherwise it's a new implicit dep.
 		new_dep(as_dep)
 		return as_dep.name
 	}
 }
 
-func (b *Builder) _lookup_explicit_dep(git_url string, subpath string) *RequestedDep {
-	for _, dep := range b.requested_deps {
-		if dep.Git_url == git_url && dep.Subpath == subpath {
-			return &dep
+func (b *Builder) _lookup_explicit_dep(git_url string, subpath string) string {
+	if b.requested_deps != nil {
+		for _, dep := range b.requested_deps {
+			if dep.Git_url == git_url && dep.Subpath == subpath {
+				return dep.name
+			}
+		}
+	} else {
+		for _, dep := range b.resolved_deps {
+			if dep.Git_url == git_url && dep.Subpath == subpath {
+				return dep.name
+			}
 		}
 	}
-	return nil
+	return ""
 }
 
 func (b *Builder) tag_repos() {
@@ -1019,7 +1076,7 @@ func (b *Builder) _reset_to_tags(deps []ResolvedDep) {
 		go func(url, ref string) {
 			defer func() {
 				if recover() != nil {
-					fmt.Fprintf(os.Stderr, "Begotten.lock refers to a missing local commit. "+
+					fmt.Fprintln(os.Stderr, "Begotten.lock refers to a missing local commit. "+
 						"Please run 'begot fetch' first.")
 					os.Exit(1)
 				}
@@ -1105,10 +1162,8 @@ func main() {
 	switch os.Args[1] {
 	case "update":
 		BuilderNew(env, ".", false).setup_repos(true, os.Args[2:]).save_lockfile().tag_repos()
-	case "just_rewrite":
-		BuilderNew(env, ".", false).setup_repos(false, []string{}).save_lockfile().tag_repos()
 	case "fetch":
-		BuilderNew(env, ".", true).setup_repos(false, []string{}).tag_repos()
+		BuilderNew(env, ".", true).fetch_repos().tag_repos()
 	case "build":
 		BuilderNew(env, ".", true).run([]string{"go", "install", "./...", EMPTY_DEP})
 	case "go":
