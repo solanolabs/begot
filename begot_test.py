@@ -125,9 +125,6 @@ def clear_cache_fetch_twice_and_build():
   # Then make sure we can build.
   begot('build')
 
-def stripiws(s):
-  return re.sub(r'^\s+', '', s, flags=re.MULTILINE)
-
 def count(it):
   c = 0
   for i in it:
@@ -135,57 +132,40 @@ def count(it):
       c += 1
   return c
 
+# code generators:
 
-NUMBER_GO = stripiws(r"""
-  package number
-  const NUMBER = 42
-""")
+def stripiws(s):
+  return re.sub(r'^\s+', '', s, flags=re.MULTILINE)
 
-DEP_IN_SAME_REPO_GO = stripiws(r"""
-  package number2
-  import "begot.test/user/repo/otherpkg"
-  const NUMBER2 = number.NUMBER + 12
-""")
+def number_go(pkg, name='NUMBER', value='42'):
+  return stripiws(r"""
+    package %s
+    const %s = %s
+  """ % (pkg, name, value))
 
-DEP_IN_OTHER_REPO_GO = stripiws(r"""
-  package number2
-  import "begot.test/otheruser/repo"
-  const NUMBER2 = number.NUMBER + 12
-""")
+def use_dep_go(pkg, deps, name='NUMBER2', numbers=['number.NUMBER', '12']):
+  if isinstance(deps, basestring): deps = [deps]
+  return stripiws(r"""
+    package %s
+  """ % pkg + ''.join(r"""
+    import "%s"
+  """ % dep for dep in deps) + r"""
+    const %s = %s
+  """ % (name, ' + '.join(numbers)))
 
-USE_BEGOT_DEP_GO = stripiws(r"""
-  package number2
-  import "tp/otherdep"
-  const NUMBER2 = number.NUMBER + 12
-""")
-
-MAIN_GO = stripiws(r"""
-  package main
-  import "fmt"
-  import "tp/dep"
-  func main() {
-    fmt.Printf("The answer is %d.", number.NUMBER)
-  }
-""")
-
-MAIN2_GO = stripiws(r"""
-  package main
-  import "fmt"
-  import "tp/dep"
-  func main() {
-    fmt.Printf("The answer is %d.", number2.NUMBER2)
-  }
-""")
-
-MAIN3_GO = stripiws(r"""
-  package main
-  import "fmt"
-  import "tp/dep"
-  import "tp/otherdep"
-  func main() {
-    fmt.Printf("The answer is %d.", number2.NUMBER2 + number3.NUMBER3)
-  }
-""")
+def main_go(deps, numbers):
+  if isinstance(deps, basestring): deps = [deps]
+  if isinstance(numbers, basestring): numbers = [numbers]
+  return stripiws(r"""
+    package main
+    import "fmt"
+  """ + ''.join(r"""
+    import "%s"
+  """ % dep for dep in deps) + r"""
+    func main() {
+      fmt.Printf("The answer is %%d.", %s)
+    }
+  """ % " + ".join(numbers))
 
 # update/fetch situations:
 
@@ -201,11 +181,11 @@ def test_empty_begotfile():
 
 def test_one_dep_at_repo_root():
   make_nonbegot_repo('user/repo',
-      {'code.go': NUMBER_GO})
+      {'code.go': number_go('number')})
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -219,11 +199,11 @@ def test_one_dep_at_repo_root():
 
 def test_one_dep_with_subpath():
   make_nonbegot_repo('user/repo',
-      {'pkg/code.go': NUMBER_GO})
+      {'pkg/code.go': number_go('number')})
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo/pkg'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -237,12 +217,12 @@ def test_one_dep_with_subpath():
 
 def test_dep_as_git_url_and_subpath():
   make_nonbegot_repo('user/repo',
-      {'pkg/code.go': NUMBER_GO})
+      {'pkg/code.go': number_go('number')})
 
   url = 'file://' + repo_path('user/repo')
   make_begot_workdir(
       {'tp/dep': {'git_url': url, 'subpath': 'pkg'}},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -257,13 +237,13 @@ def test_dep_as_git_url_and_subpath():
 def test_one_dep_with_implicit_dep_in_same_repo():
   make_nonbegot_repo('user/repo',
       {
-        'pkg/code.go': DEP_IN_SAME_REPO_GO,
-        'otherpkg/code.go': NUMBER_GO,
+        'pkg/code.go': use_dep_go('number2', 'begot.test/user/repo/otherpkg'),
+        'otherpkg/code.go': number_go('number'),
       })
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo/pkg'},
-      {'app/main2.go': MAIN2_GO})
+      {'app/main2.go': main_go('tp/dep', 'number2.NUMBER2')})
 
   begot('update')
 
@@ -283,17 +263,17 @@ def test_one_dep_with_implicit_dep_in_same_repo():
 def test_one_dep_with_implicit_dep_in_other_repo():
   make_nonbegot_repo('otheruser/repo',
       {
-        'code.go': NUMBER_GO,
+        'code.go': number_go('number'),
       })
 
   make_nonbegot_repo('user/repo',
       {
-        'code.go': DEP_IN_OTHER_REPO_GO,
+        'code.go': use_dep_go('number2', 'begot.test/otheruser/repo'),
       })
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main2.go': MAIN2_GO})
+      {'app/main2.go': main_go('tp/dep', 'number2.NUMBER2')})
 
   begot('update')
 
@@ -314,11 +294,11 @@ def test_one_dep_with_implicit_dep_in_other_repo():
 def test_begot_dep():
   make_begot_repo('user/repo',
       {},
-      {'code.go': NUMBER_GO})
+      {'code.go': number_go('number')})
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -333,11 +313,11 @@ def test_begot_dep():
 def test_begot_dep_with_subpath():
   make_begot_repo('user/repo',
       {},
-      {'pkg/code.go': NUMBER_GO})
+      {'pkg/code.go': number_go('number')})
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo/pkg'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -352,15 +332,15 @@ def test_begot_dep_with_subpath():
 def test_begot_dep_with_begot_dep_different_name(): # both have subpaths
   make_begot_repo('user/otherrepo',
       {},
-      {'pkg2/code.go': NUMBER_GO})
+      {'pkg2/code.go': number_go('number')})
 
   make_begot_repo('user/repo',
       {'tp/otherdep': 'begot.test/user/otherrepo/pkg2'},
-      {'pkg/code.go': USE_BEGOT_DEP_GO})
+      {'pkg/code.go': use_dep_go('number2', 'tp/otherdep')})
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo/pkg'},
-      {'app/main.go': MAIN2_GO})
+      {'app/main.go': main_go('tp/dep', 'number2.NUMBER2')})
 
   begot('update')
 
@@ -378,19 +358,15 @@ def test_begot_dep_with_begot_dep_different_name(): # both have subpaths
 def test_begot_dep_with_begot_dep_same_name():
   make_begot_repo('user/otherrepo',
       {},
-      {'pkg2/code.go': NUMBER_GO})
+      {'pkg2/code.go': number_go('number')})
 
   make_begot_repo('user/repo',
       {'tp/dep': 'begot.test/user/otherrepo/pkg2'},
-      {'pkg/code.go': stripiws(r"""
-          package number2
-          import "tp/dep"
-          const NUMBER2 = number.NUMBER + 12
-      """)})
+      {'pkg/code.go': use_dep_go('number2', 'tp/dep')})
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo/pkg'},
-      {'app/main.go': MAIN2_GO})
+      {'app/main.go': main_go('tp/dep', 'number2.NUMBER2')})
 
   begot('update')
 
@@ -411,8 +387,8 @@ def test_self_dep():
   make_begot_workdir(
       {},
       {
-        'app/main.go': MAIN_GO,
-        'tp/dep/code.go': NUMBER_GO,
+        'app/main.go': main_go('tp/dep', 'number.NUMBER'),
+        'tp/dep/code.go': number_go('number'),
       })
 
   begot('update')
@@ -426,13 +402,13 @@ def test_begot_dep_with_self_dep():
   make_begot_repo('user/repo',
       {},
       {
-        'code.go': USE_BEGOT_DEP_GO,
-        'tp/otherdep/morecode.go': NUMBER_GO,
+        'code.go': use_dep_go('number2', 'tp/otherdep'),
+        'tp/otherdep/morecode.go': number_go('number'),
       })
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN2_GO})
+      {'app/main.go': main_go('tp/dep', 'number2.NUMBER2')})
 
   begot('update')
 
@@ -451,25 +427,14 @@ def test_begot_dep_with_two_self_deps_prefix():
   make_begot_repo('user/repo',
       {},
       {
-        'code.go': stripiws(r"""
-          package number2
-          import "self"
-          import "self/self"
-          const NUMBER2 = self1.N + self2.M
-        """),
-        'self/code.go': stripiws(r"""
-          package self1
-          const N = 25
-        """),
-        'self/self/code.go': stripiws(r"""
-          package self2
-          const M = 17
-        """),
+        'code.go': use_dep_go('number2', ['self', 'self/self'], 'NUMBER2', ['self1.N', 'self2.M']),
+        'self/code.go': number_go('self1', 'N', '25'),
+        'self/self/code.go': number_go('self2', 'M', '17'),
       })
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN2_GO})
+      {'app/main.go': main_go('tp/dep', 'number2.NUMBER2')})
 
   begot('update')
 
@@ -488,35 +453,22 @@ def test_two_begot_deps_with_two_self_deps():
   make_begot_repo('user/repo',
       {},
       {
-        'code.go': stripiws(r"""
-          package number2
-          import "self"
-          const NUMBER2 = self1.N + 13
-        """),
-        'self/code.go': stripiws(r"""
-          package self1
-          const N = 6
-        """),
+        'code.go': use_dep_go('number2', 'self', 'NUMBER2', ['self1.N', '13']),
+        'self/code.go': number_go('self1', 'N', '6'),
       })
 
   make_begot_repo('user/otherrepo',
       {},
       {
-        'code.go': stripiws(r"""
-          package number3
-          import "self"
-          const NUMBER3 = self3.O + 5
-        """),
-        'self/code.go': stripiws(r"""
-          package self3
-          const O = 19
-        """),
+        'code.go': use_dep_go('number3', 'self', 'NUMBER3', ['self3.O', '5']),
+        'self/code.go': number_go('self3', 'O', '19'),
       })
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo',
        'tp/otherdep': 'begot.test/user/otherrepo'},
-      {'app/main.go': MAIN3_GO})
+      {'app/main.go': main_go(['tp/dep', 'tp/otherdep'],
+                              ['number2.NUMBER2', 'number3.NUMBER3'])})
 
   begot('update')
 
@@ -533,29 +485,22 @@ def test_two_implicit_deps_prefix():
   # The replacement of slash by underscore lets this work.
   make_nonbegot_repo('user/otherrepo',
       {
-        'code.go': stripiws(r"""
-          package implicit1
-          const N = 23
-        """),
-        'pkg/code.go': stripiws(r"""
-          package implicit2
-          const M = 19
-        """),
+        'code.go': number_go('implicit1', 'N', '23'),
+        'pkg/code.go': number_go('implicit2', 'M', '19'),
       })
 
   make_nonbegot_repo('user/repo',
       {
-        'code.go': stripiws(r"""
-          package number
-          import "begot.test/user/otherrepo"
-          import "begot.test/user/otherrepo/pkg"
-          const NUMBER = implicit1.N + implicit2.M
-        """),
+        'code.go': use_dep_go('number',
+                              ['begot.test/user/otherrepo',
+                               'begot.test/user/otherrepo/pkg'],
+                              'NUMBER',
+                              ['implicit1.N', 'implicit2.M']),
       })
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main2.go': MAIN_GO})
+      {'app/main2.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -574,44 +519,31 @@ def test_two_begot_deps_with_deps_with_same_name():
   # Note that the two begot deps use tp/subdep to refer to different things.
   make_nonbegot_repo('depuser/repo',
       {
-        'code.go': stripiws(r"""
-          package dep1
-          const N = 33
-        """),
+        'code.go': number_go('dep1', 'N', '33'),
       })
 
   make_nonbegot_repo('depuser/otherrepo',
       {
-        'code.go': stripiws(r"""
-          package dep2
-          const M = 11
-        """),
+        'code.go': number_go('dep2', 'M', '11'),
       })
 
   make_begot_repo('user/repo',
       {'tp/subdep': 'begot.test/depuser/repo'},
       {
-        'code.go': stripiws(r"""
-          package number2
-          import "tp/subdep"
-          const NUMBER2 = dep1.N + 5
-        """),
+        'code.go': use_dep_go('number2', 'tp/subdep', 'NUMBER2', ['dep1.N', '5']),
       })
 
   make_begot_repo('user/otherrepo',
       {'tp/subdep': 'begot.test/depuser/otherrepo'},
       {
-        'code.go': stripiws(r"""
-          package number3
-          import "tp/subdep"
-          const NUMBER3 = dep2.M + 6
-        """),
+        'code.go': use_dep_go('number3', 'tp/subdep', 'NUMBER3', ['dep2.M', '6']),
       })
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo',
        'tp/otherdep': 'begot.test/user/otherrepo'},
-      {'app/main.go': MAIN3_GO})
+      {'app/main.go': main_go(['tp/dep', 'tp/otherdep'],
+                              ['number2.NUMBER2', 'number3.NUMBER3'])})
 
   begot('update')
 
@@ -624,7 +556,7 @@ def test_two_begot_deps_with_deps_with_same_name():
 
 
 def test_conflict_between_two_deps():
-  make_nonbegot_repo('user/repo', {'code.go': NUMBER_GO})
+  make_nonbegot_repo('user/repo', {'code.go': number_go('number')})
 
   with chdir(repo_path('user/repo')):
     git('tag', 'one')
@@ -642,7 +574,7 @@ def test_conflict_between_two_deps():
 
 def test_conflict_between_dep_and_dep_of_dep():
   make_nonbegot_repo('otheruser/repo',
-      {'code.go': NUMBER_GO})
+      {'code.go': number_go('number')})
 
   with chdir(repo_path('otheruser/repo')):
     git('tag', 'one')
@@ -657,14 +589,14 @@ def test_conflict_between_dep_and_dep_of_dep():
   make_begot_workdir(
       {'tp/dep': {'import_path': 'begot.test/user/repo'},
        'tp/otherdep': {'import_path': 'begot.test/otheruser/repo', 'ref': 'one'}},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot_err('update', expect="Conflicting versions")
 
 
 def test_nonconflict_between_dep_with_ref_and_implicit_dep():
   make_nonbegot_repo('otheruser/repo',
-      {'code.go': NUMBER_GO})
+      {'code.go': number_go('number')})
 
   with chdir(repo_path('otheruser/repo')):
     git('tag', 'one')
@@ -676,12 +608,12 @@ def test_nonconflict_between_dep_with_ref_and_implicit_dep():
     assert one != master
 
   make_nonbegot_repo('user/repo',
-      {'code.go': DEP_IN_OTHER_REPO_GO})
+      {'code.go': use_dep_go('number2', 'begot.test/otheruser/repo')})
 
   make_begot_workdir(
       {'tp/dep': {'import_path': 'begot.test/user/repo'},
        'tp/otherdep': {'import_path': 'begot.test/otheruser/repo', 'ref': 'one'}},
-      {'app/main.go': MAIN2_GO})
+      {'app/main.go': main_go('tp/dep', 'number2.NUMBER2')})
 
   begot('update')
 
@@ -695,7 +627,7 @@ def test_nonconflict_between_dep_with_ref_and_implicit_dep():
 
 def test_dep_with_branch():
   make_nonbegot_repo('user/repo',
-      {'pkg/code.go': NUMBER_GO})
+      {'pkg/code.go': number_go('number')})
 
   with chdir(repo_path('user/repo')):
     git('checkout', '-b', 'branch')
@@ -705,7 +637,7 @@ def test_dep_with_branch():
 
   make_begot_workdir(
       {'tp/dep': {'import_path': 'begot.test/user/repo/pkg', 'ref': 'branch'}},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -718,7 +650,7 @@ def test_dep_with_branch():
 
 def test_dep_with_commit_id():
   make_nonbegot_repo('user/repo',
-      {'pkg/code.go': NUMBER_GO})
+      {'pkg/code.go': number_go('number')})
 
   with chdir(repo_path('user/repo')):
     ref = git('rev-parse', 'master').strip()
@@ -728,7 +660,7 @@ def test_dep_with_commit_id():
 
   make_begot_workdir(
       {'tp/dep': {'import_path': 'begot.test/user/repo/pkg', 'ref': ref}},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -741,11 +673,11 @@ def test_dep_with_commit_id():
 
 def test_repo_alias_simple():
   make_nonbegot_repo('otheruser/repo',
-      {'code.go': NUMBER_GO})
+      {'code.go': number_go('number')})
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   aliases = {'repo_aliases': {'begot.test/user/repo': 'begot.test/otheruser/repo'}}
   yaml.safe_dump(aliases, open('Begotten', 'a'))
@@ -761,12 +693,12 @@ def test_repo_alias_simple():
 def test_repo_alias_with_implicit_dep_on_self():
   make_nonbegot_repo('otheruser/repo',
       # imports begot.test/user/repo/otherpkg, but gets redirected to self.
-      {'pkg/code.go': DEP_IN_SAME_REPO_GO,
-       'otherpkg/code.go': NUMBER_GO})
+      {'pkg/code.go': use_dep_go('number2', 'begot.test/user/repo/otherpkg'),
+       'otherpkg/code.go': number_go('number')})
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo/pkg'},
-      {'app/main.go': MAIN2_GO})
+      {'app/main.go': main_go('tp/dep', 'number2.NUMBER2')})
 
   aliases = {'repo_aliases': {'begot.test/user/repo': 'begot.test/otheruser/repo'}}
   yaml.safe_dump(aliases, open('Begotten', 'a'))
@@ -848,7 +780,7 @@ def test_limited_update():
 def test_limited_update_with_implicit_dep():
   make_nonbegot_repo('otheruser/repo', {'a': 'a'})
   make_nonbegot_repo('user/repo1', {
-    'code.go': DEP_IN_OTHER_REPO_GO,
+    'code.go': use_dep_go('number2', 'begot.test/otheruser/repo'),
     })
   make_nonbegot_repo('user/repo2', {'a': 'a'})
 
@@ -922,10 +854,10 @@ def test_limited_update_with_explicit_dep():
 
 
 def test_fetch_before_build():
-  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_nonbegot_repo('user/repo', {'number.go': number_go('number')})
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
   clear_cache()
@@ -933,10 +865,10 @@ def test_fetch_before_build():
 
 
 def test_fetch_can_fetch():
-  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_nonbegot_repo('user/repo', {'number.go': number_go('number')})
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
 
@@ -957,10 +889,10 @@ def test_fetch_can_fetch():
 
 
 def test_no_rebuild():
-  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_nonbegot_repo('user/repo', {'number.go': number_go('number')})
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
   begot('build')
@@ -974,10 +906,10 @@ def test_no_rebuild():
 
 
 def test_rebuild_on_local_change():
-  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_nonbegot_repo('user/repo', {'number.go': number_go('number')})
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
   begot('build')
@@ -992,10 +924,10 @@ def test_rebuild_on_local_change():
 
 
 def test_rebuild_on_dep_change():
-  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_nonbegot_repo('user/repo', {'number.go': number_go('number')})
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   begot('update')
   begot('build')
@@ -1017,8 +949,8 @@ def test_rebuild_on_self_dep_change():
   make_begot_workdir(
       {},
       {
-        'app/main.go': MAIN_GO,
-        'tp/dep/code.go': NUMBER_GO,
+        'app/main.go': main_go('tp/dep', 'number.NUMBER'),
+        'tp/dep/code.go': number_go('number'),
       })
 
   begot('update')
@@ -1046,7 +978,7 @@ def test_build_consistency():
     with chdir(t):
       make_begot_workdir(
           {'tp/dep': 'begot.test/user/repo'},
-          {'app/main.go': MAIN_GO})
+          {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
       begot('update')
 
     with chdir(repo_path('user/repo')):
@@ -1075,7 +1007,7 @@ def test_build_consistency_across_repo_rename():
 
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
   begot('update')
 
   os.rename('Begotten', 'orig-Begotten')
@@ -1095,10 +1027,10 @@ def test_build_consistency_across_repo_rename():
 
 
 def test_clean_and_gopath():
-  make_nonbegot_repo('user/repo', {'number.go': NUMBER_GO})
+  make_nonbegot_repo('user/repo', {'number.go': number_go('number')})
   make_begot_workdir(
       {'tp/dep': 'begot.test/user/repo'},
-      {'app/main.go': MAIN_GO})
+      {'app/main.go': main_go('tp/dep', 'number.NUMBER')})
 
   gopath = begot('gopath').strip()
   begot('update')
