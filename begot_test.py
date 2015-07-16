@@ -1026,6 +1026,33 @@ def test_build_consistency_across_repo_rename():
   assert co('./bin/app') == 'The answer is 42.'
 
 
+def test_collapsing():
+  """When A -> C and A -> B -> C, we should get only one copy of C."""
+
+  make_nonbegot_repo('user/repo',
+      {'code.go': number_go('number', 'N')})
+
+  make_nonbegot_repo('user/otherrepo',
+      {'code.go': use_dep_go('othernumber', 'begot.test/user/repo', 'O', ['number.N', '13'])})
+
+  make_begot_workdir(
+      {'tp/dep1': 'begot.test/user/repo',
+       'tp/dep2': 'begot.test/user/otherrepo'},
+      {'app/main.go': main_go(['tp/dep1', 'tp/dep2'], ['number.N', 'othernumber.O'])})
+
+  begot('update')
+
+  deps = read_lockfile_deps(2)
+
+  dep1 = deps.pop('tp/dep1')
+  assert dep1['git_url'].endswith('user/repo')
+
+  dep2 = deps.pop('tp/dep2')
+  assert dep2['git_url'].endswith('user/otherrepo')
+
+  clear_cache_fetch_twice_and_build()
+
+
 def test_clean_and_gopath():
   make_nonbegot_repo('user/repo', {'number.go': number_go('number')})
   make_begot_workdir(
