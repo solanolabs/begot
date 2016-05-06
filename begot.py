@@ -219,6 +219,7 @@ KNOWN_GIT_SERVERS = {
   'github.com': 2,
   'bitbucket.org': 2,
   'begot.test': 2,
+  'go.googlesource.com': 2,
 }
 
 cc = subprocess.check_call
